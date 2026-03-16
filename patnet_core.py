@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field, asdict
@@ -351,7 +352,6 @@ class SimpleClaudeCodeClient:
             model=self.model,
             system_prompt=system_prompt,
             env=env,
-            # Include user settings so local Claude login/session can be reused.
             setting_sources=["user", "project"],
             cli_path=cli_path,
         )
@@ -359,29 +359,64 @@ class SimpleClaudeCodeClient:
         parts: list[str] = []
         sdk_client = ClaudeSDKClient(options=options)
         session_id = str(uuid.uuid4())
+        msg_count = 0
+        t_start = time.monotonic()
+
+        print(f"[claude] session {session_id[:8]} start | model={self.model or 'default'} | cwd={workspace_path}")
+        print(f"[claude] prompt length: {len(message)} chars | timeout: {timeout}s")
 
         try:
             async with asyncio.timeout(timeout):
                 await sdk_client.connect()
+                print(f"[claude] connected, sending query ...")
                 await sdk_client.query(message, session_id=session_id)
                 async for sdk_message in sdk_client.receive_response():
+                    msg_count += 1
+                    elapsed = time.monotonic() - t_start
+                    msg_type = type(sdk_message).__name__
+
                     if isinstance(sdk_message, AssistantMessage):
+                        text_blocks = []
+                        tool_blocks = []
                         for block in sdk_message.content:
                             if isinstance(block, TextBlock) and (block.text or "").strip():
                                 parts.append(block.text)
+                                text_blocks.append(block.text)
+                            else:
+                                block_type = type(block).__name__
+                                tool_blocks.append(block_type)
+
+                        if text_blocks:
+                            preview = text_blocks[0][:120].replace("\n", " ")
+                            print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
+                                  f"text={len(text_blocks)} blocks | preview: {preview}")
+                        if tool_blocks:
+                            print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
+                                  f"tool_use: {', '.join(tool_blocks)}")
+
                     elif isinstance(sdk_message, ResultMessage):
                         result_text = (sdk_message.result or "").strip()
                         if result_text:
                             parts.append(result_text)
+                        preview = result_text[:120].replace("\n", " ") if result_text else "(empty)"
+                        print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} ResultMessage | preview: {preview}")
+
+                    else:
+                        print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} {msg_type}")
+
         finally:
+            elapsed_total = time.monotonic() - t_start
             try:
                 await sdk_client.disconnect()
             except Exception:
                 pass
+            print(f"[claude] session {session_id[:8]} done | {elapsed_total:.1f}s | "
+                  f"messages={msg_count} | output_parts={len(parts)}")
 
         output = "\n".join(part for part in parts if part.strip()).strip()
         if not output:
             raise RuntimeError("cloudcode returned empty response")
+        print(f"[claude] final output: {len(output)} chars")
         return output
 
     def _load_sdk(self) -> dict[str, Any]:
