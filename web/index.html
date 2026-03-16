@@ -322,6 +322,101 @@
         font-size: 11px;
       }
 
+      .label-primary {
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--ink);
+        text-transform: none;
+      }
+
+      .btn-secondary {
+        margin-top: 10px;
+        width: 100%;
+        border: 1px solid var(--accent);
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        color: var(--accent);
+        background: rgba(13, 122, 95, 0.08);
+        transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+      }
+
+      .btn-secondary:hover {
+        background: rgba(13, 122, 95, 0.16);
+        transform: translateY(-1px);
+      }
+
+      .btn-secondary:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .progress-wrap {
+        margin-top: 10px;
+        display: none;
+      }
+
+      .progress-wrap.active {
+        display: block;
+      }
+
+      .progress-bar-outer {
+        height: 6px;
+        background: var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      .progress-bar-inner {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent), #23a882);
+        border-radius: 6px;
+        transition: width 300ms ease;
+      }
+
+      .progress-text {
+        font-size: 11px;
+        color: var(--ink-soft);
+        margin-top: 4px;
+      }
+
+      .pp-preview {
+        margin-top: 8px;
+        max-height: 160px;
+        overflow: auto;
+        font-size: 11px;
+        line-height: 1.55;
+        color: var(--ink-soft);
+        display: none;
+      }
+
+      .pp-preview.active {
+        display: block;
+      }
+
+      .pp-preview .pp-item {
+        padding: 4px 0;
+        border-bottom: 1px dashed var(--line);
+      }
+
+      .pp-preview .pp-item:last-child {
+        border-bottom: none;
+      }
+
+      .pp-tag {
+        display: inline-block;
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 6px;
+        background: rgba(13, 122, 95, 0.12);
+        color: var(--accent);
+        margin-left: 4px;
+      }
+
       @media (max-width: 980px) {
         .layout {
           grid-template-columns: 1fr;
@@ -333,8 +428,7 @@
     <div class="shell">
       <div class="hero">
         <div>
-          <h1 class="title">Patent Check Console</h1>
-          <p class="subtitle">仓库目录 + 专利文件选择上传，执行并可视化展示结果。</p>
+          <h1 class="title">Patent Check</h1>
         </div>
         <div id="status-chip" class="status-chip">当前扫描状态：空闲</div>
       </div>
@@ -343,13 +437,7 @@
         <section class="panel">
           <div class="head">输入参数</div>
           <div class="body">
-            <label>仓库目录（选择整个项目文件夹）</label>
-            <div class="select-box">
-              <input id="repo-picker" type="file" webkitdirectory directory multiple />
-              <div id="repo-selected" class="selected">未选择</div>
-            </div>
-
-            <label>专利文件（可多选）</label>
+            <label class="label-primary">专利文件（可多选）</label>
             <div class="select-box">
               <input
                 id="patent-picker"
@@ -358,6 +446,21 @@
                 accept=".pdf,.doc,.docx,.txt,.md,.json,.xml,.html,.htm"
               />
               <div id="patent-selected" class="selected">未选择</div>
+            </div>
+
+            <button id="preprocess-btn" class="btn-secondary" disabled>预处理专利（AI 结构化提取）</button>
+            <div id="pp-progress" class="progress-wrap">
+              <div class="progress-bar-outer">
+                <div id="pp-bar" class="progress-bar-inner"></div>
+              </div>
+              <div id="pp-text" class="progress-text">准备中...</div>
+            </div>
+            <div id="pp-preview" class="pp-preview"></div>
+
+            <label class="label-primary">仓库目录（选择整个项目文件夹）</label>
+            <div class="select-box">
+              <input id="repo-picker" type="file" webkitdirectory directory multiple />
+              <div id="repo-selected" class="selected">未选择</div>
             </div>
 
             <div class="inline-grid">
@@ -506,6 +609,11 @@
         maxPatterns: document.getElementById('max-patterns'),
         maxMatches: document.getElementById('max-matches'),
         runBtn: document.getElementById('run-btn'),
+        preprocessBtn: document.getElementById('preprocess-btn'),
+        ppProgress: document.getElementById('pp-progress'),
+        ppBar: document.getElementById('pp-bar'),
+        ppText: document.getElementById('pp-text'),
+        ppPreview: document.getElementById('pp-preview'),
         statusChip: document.getElementById('status-chip'),
         detailText: document.getElementById('detail-text'),
         summaryCards: document.getElementById('summary-cards'),
@@ -517,7 +625,10 @@
         stderrBox: document.getElementById('stderr-box'),
       }
       const ACTIVE_JOB_KEY = 'patent_check_active_job_id'
+      const PP_JOB_KEY = 'patent_check_preprocess_job_id'
       let activeJobId = ''
+      let ppJobId = ''
+      let ppPollTimerId = null
       let pollTimerId = null
 
       function setRunBusy(isBusy) {
@@ -755,8 +866,20 @@
         ui.stderrBox.textContent = data.stderr || '-'
       }
 
+      const STAGE_LABELS = {
+        init: '初始化',
+        scanner: 'Scanner 代码扫描',
+        layer1_bm25: 'Layer 1 BM25 召回',
+        layer2_rerank: 'Layer 2 轻量复筛',
+        layer3_deep: 'Layer 3 深度比对',
+        validator: '专利比对验证',
+        post_processing: '结果汇总',
+      }
+
       function renderRunningJob(data = {}) {
-        setStatus('扫描中', 'run')
+        const stage = String(data.stage || '').trim()
+        const stageLabel = STAGE_LABELS[stage] || stage || '扫描中'
+        setStatus(stageLabel, 'run')
         const stat = data.upload_stats || {}
         const elapsedMs = Number(data.elapsed_ms || 0)
         renderUsedInputs(data.used_inputs || null, '', [])
@@ -843,9 +966,141 @@
         const files = Array.from(ui.patentPicker.files || [])
         if (!files.length) {
           ui.patentSelected.textContent = '未选择'
+          ui.preprocessBtn.disabled = true
           return
         }
         ui.patentSelected.textContent = `文件数：${files.length}`
+        ui.preprocessBtn.disabled = false
+        ppJobId = ''
+        localStorage.removeItem(PP_JOB_KEY)
+        ui.ppProgress.classList.remove('active')
+        ui.ppPreview.classList.remove('active')
+        ui.ppPreview.innerHTML = ''
+      }
+
+      function stopPpPolling() {
+        if (ppPollTimerId !== null) {
+          clearTimeout(ppPollTimerId)
+          ppPollTimerId = null
+        }
+      }
+
+      function setPpBusy(busy) {
+        ui.preprocessBtn.disabled = busy
+      }
+
+      function renderPpPreview(patents = []) {
+        if (!patents.length) {
+          ui.ppPreview.classList.remove('active')
+          ui.ppPreview.innerHTML = ''
+          return
+        }
+        ui.ppPreview.classList.add('active')
+        ui.ppPreview.innerHTML = patents
+          .map((p, i) => {
+            const title = p.title || p.path || '-'
+            const kw = (p.keywords || []).slice(0, 5).map(k => `<span class="pp-tag">${k}</span>`).join('')
+            return `<div class="pp-item">${i + 1}. ${title}${kw}</div>`
+          })
+          .join('')
+      }
+
+      async function pollPreprocessStatus(jobId) {
+        const token = String(jobId || '').trim()
+        if (!token) return
+        stopPpPolling()
+        setPpBusy(true)
+        ppJobId = token
+        localStorage.setItem(PP_JOB_KEY, token)
+        ui.ppProgress.classList.add('active')
+        setStatus('预处理中', 'run')
+
+        const tick = async () => {
+          try {
+            const resp = await fetch(`/api/preprocess/${encodeURIComponent(token)}`)
+            const data = await resp.json()
+            if (!resp.ok) throw new Error(data.detail || '查询失败')
+
+            const status = String(data.status || '').toLowerCase()
+            const done = Number(data.progress_done || 0)
+            const total = Math.max(Number(data.progress_total || 1), 1)
+            const pct = Math.min(100, Math.round((done / total) * 100))
+
+            ui.ppBar.style.width = pct + '%'
+            ui.ppText.textContent = `正在预处理第 ${done} / ${total} 个专利...`
+            setStatus(`预处理中 ${done}/${total}`, 'run')
+
+            if (status === 'queued' || status === 'running') {
+              renderPpPreview(data.patents || [])
+              ppPollTimerId = setTimeout(tick, 2000)
+              return
+            }
+            if (status === 'completed') {
+              ui.ppBar.style.width = '100%'
+              ui.ppText.textContent = `预处理完成: ${(data.patents || []).length} 个专利`
+              setStatus('预处理完成', 'ok')
+              renderPpPreview(data.patents || [])
+              setPpBusy(false)
+              return
+            }
+            if (status === 'failed') {
+              ui.ppText.textContent = `预处理失败: ${data.error || data.detail || ''}`
+              ui.ppBar.style.width = '0%'
+              setStatus('预处理失败', 'err')
+              ppJobId = ''
+              localStorage.removeItem(PP_JOB_KEY)
+              setPpBusy(false)
+              return
+            }
+            throw new Error(`未知状态: ${status}`)
+          } catch (err) {
+            ui.ppText.textContent = `预处理查询失败: ${err}`
+            ppPollTimerId = setTimeout(tick, 3000)
+          }
+        }
+        await tick()
+      }
+
+      async function startPreprocess() {
+        const patentFiles = Array.from(ui.patentPicker.files || [])
+        if (!patentFiles.length) {
+          alert('请先选择专利文件')
+          return
+        }
+        if (ppJobId) {
+          const ok = confirm('已有预处理结果，是否重新预处理？')
+          if (!ok) return
+        }
+
+        const form = new FormData()
+        for (const file of patentFiles) {
+          form.append('patent_files', file, file.name)
+        }
+        form.append('model', ui.model.value.trim())
+
+        setPpBusy(true)
+        ui.ppProgress.classList.add('active')
+        ui.ppBar.style.width = '0%'
+        ui.ppText.textContent = '正在上传专利文件...'
+        ui.ppPreview.classList.remove('active')
+        setStatus('预处理上传中', 'run')
+
+        try {
+          const resp = await fetch('/api/preprocess', {
+            method: 'POST',
+            body: form,
+          })
+          const data = await resp.json()
+          if (!resp.ok) throw new Error(data.detail || '提交失败')
+
+          const jobId = String(data.job_id || '').trim()
+          if (!jobId) throw new Error('服务端未返回任务ID')
+          await pollPreprocessStatus(jobId)
+        } catch (err) {
+          ui.ppText.textContent = `预处理提交失败: ${err}`
+          setStatus('预处理失败', 'err')
+          setPpBusy(false)
+        }
       }
 
       async function runScan() {
@@ -860,8 +1115,10 @@
           alert('请先选择仓库目录')
           return
         }
-        if (!patentFiles.length) {
-          alert('请先选择专利文件')
+
+        const hasPreprocess = Boolean(ppJobId)
+        if (!patentFiles.length && !hasPreprocess) {
+          alert('请先选择专利文件，或先点击「预处理专利」')
           return
         }
 
@@ -878,6 +1135,9 @@
         form.append('model', ui.model.value.trim())
         form.append('max_patterns', String(Number(ui.maxPatterns.value) || 30))
         form.append('max_matches', String(Number(ui.maxMatches.value) || 50))
+        if (hasPreprocess) {
+          form.append('preprocess_job_id', ppJobId)
+        }
 
         setRunBusy(true)
         setStatus('扫描中', 'run')
@@ -929,6 +1189,7 @@
 
       ui.repoPicker.addEventListener('change', refreshRepoSelected)
       ui.patentPicker.addEventListener('change', refreshPatentSelected)
+      ui.preprocessBtn.addEventListener('click', startPreprocess)
       ui.runBtn.addEventListener('click', runScan)
       renderSummary({})
       renderPatterns([])
@@ -948,6 +1209,14 @@
         await pollJobStatus(savedJobId)
       }
 
+      async function resumePreprocessIfNeeded() {
+        const savedPpId = String(localStorage.getItem(PP_JOB_KEY) || '').trim()
+        if (!savedPpId) return
+        ppJobId = savedPpId
+        await pollPreprocessStatus(savedPpId)
+      }
+
+      resumePreprocessIfNeeded()
       resumeActiveJobIfNeeded()
     </script>
   </body>

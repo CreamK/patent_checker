@@ -17,7 +17,18 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from patnet_core import PatentCheckOptions, run_patent_check
+from patnet_core import (
+    PatentCheckOptions,
+    run_patent_check,
+    PatentSkillAdapter,
+    PatentCache,
+    ParsedPatent,
+    SimpleClaudeCodeClient,
+    preprocess_patents,
+    read_patent_text,
+    guess_title,
+    compute_file_hash,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -146,7 +157,12 @@ async def _run_upload_job(
     temp_root: Path,
 ) -> None:
     started_mono = time.monotonic()
-    await _update_job(job_id, status="running", detail="扫描任务执行中", started_at=_now_ms())
+    await _update_job(job_id, status="running", detail="扫描任务执行中", started_at=_now_ms(), stage="init")
+
+    async def _on_stage(stage: str, detail: str = "") -> None:
+        await _update_job(job_id, stage=stage, detail=detail or stage)
+
+    options.on_stage = _on_stage
 
     try:
         exit_code, stdout_text, stderr_text, result_json = await _run_core_patent_check(options)
@@ -263,11 +279,15 @@ async def run_scan_upload(
     max_patterns: int = Form(default=30),
     max_matches: int = Form(default=50),
     model: str = Form(default=""),
+    preprocess_job_id: str = Form(default=""),
 ) -> dict[str, Any]:
     if not repo_files:
         raise HTTPException(status_code=400, detail="repo_files is empty")
-    if not patent_files:
-        raise HTTPException(status_code=400, detail="patent_files is empty")
+
+    pp_job_id = preprocess_job_id.strip()
+    has_preprocess = bool(pp_job_id)
+    if not patent_files and not has_preprocess:
+        raise HTTPException(status_code=400, detail="patent_files is empty and no preprocess_job_id")
 
     temp_root = Path(tempfile.mkdtemp(prefix="patent_web_upload_")).resolve()
     repo_dir = temp_root / "repo"
@@ -312,7 +332,30 @@ async def run_scan_upload(
                 }
             )
 
-        if not saved_patent_paths:
+        # Resolve patents: from preprocess job or from uploaded files
+        parsed_patents_for_options: list[ParsedPatent] | None = None
+
+        if has_preprocess:
+            pp_job = await _get_job(pp_job_id)
+            if pp_job and str(pp_job.get("status") or "").lower() == "completed":
+                cache = PatentCache()
+                pp_patent_list = pp_job.get("patents") or []
+                loaded: list[ParsedPatent] = []
+                for pp in pp_patent_list:
+                    fh = pp.get("file_hash", "")
+                    cached = cache.get(fh) if fh else None
+                    if cached:
+                        loaded.append(cached)
+                if loaded:
+                    parsed_patents_for_options = loaded
+                    if not saved_patent_paths:
+                        saved_patent_paths = [Path(p.path) for p in loaded]
+                    patent_upload_meta = [
+                        {"uploaded_name": Path(p.path).name, "file_name": Path(p.path).name}
+                        for p in loaded
+                    ]
+
+        if not saved_patent_paths and not parsed_patents_for_options:
             raise HTTPException(status_code=400, detail="no usable patent files uploaded")
 
         options = PatentCheckOptions(
@@ -323,6 +366,7 @@ async def run_scan_upload(
             timeout=timeout,
             max_patterns=max_patterns,
             max_matches=max_matches,
+            parsed_patents=parsed_patents_for_options,
         )
 
         used_patents = []
@@ -394,6 +438,173 @@ async def run_scan_upload(
 
 @app.get("/api/run-upload/{job_id}")
 async def get_run_upload_job(job_id: str) -> dict[str, Any]:
+    await _cleanup_jobs()
+    job = await _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+
+    if str(job.get("status") or "").lower() in {"queued", "running"}:
+        started_at = job.get("started_at") or job.get("created_at")
+        try:
+            started_ms = int(started_at or 0)
+        except Exception:
+            started_ms = 0
+        if started_ms > 0:
+            job["elapsed_ms"] = max(0, _now_ms() - started_ms)
+        else:
+            job["elapsed_ms"] = 0
+    else:
+        job["elapsed_ms"] = job.get("duration_ms")
+    return job
+
+
+# ── Preprocess API ────────────────────────────────────────────────────
+
+async def _run_preprocess_job(
+    *,
+    job_id: str,
+    patent_paths: list[str],
+    model: str | None,
+    temp_root: Path,
+) -> None:
+    started_mono = time.monotonic()
+    await _update_job(job_id, status="running", detail="预处理执行中", started_at=_now_ms())
+
+    try:
+        cloud_client = SimpleClaudeCodeClient(model=model)
+        available, detail = cloud_client.check_available()
+        if not available:
+            raise RuntimeError(f"cloudcode unavailable: {detail}")
+
+        skill_adapter = PatentSkillAdapter()
+        preprocessor_skill = skill_adapter.load_patent_preprocessor()
+        cache = PatentCache()
+
+        async def on_progress(done: int, total: int, msg: str) -> None:
+            await _update_job(
+                job_id,
+                detail=f"预处理中 {done}/{total}",
+                progress=f"{done}/{total}",
+                progress_done=done,
+                progress_total=total,
+            )
+
+        parsed_list, errors = await preprocess_patents(
+            patent_paths,
+            cloud_client,
+            preprocessor_skill,
+            cache,
+            on_progress=on_progress,
+        )
+
+        duration_ms = int((time.monotonic() - started_mono) * 1000)
+        patents_result = []
+        for p in parsed_list:
+            patents_result.append({
+                "file_hash": p.file_hash,
+                "path": p.path,
+                "title": p.title or p.raw_title,
+                "abstract": p.abstract[:300] if p.abstract else "",
+                "keywords": p.keywords[:10],
+                "claims_count": len(p.independent_claims),
+            })
+
+        await _update_job(
+            job_id,
+            status="completed",
+            detail=f"预处理完成: {len(parsed_list)} 个专利",
+            finished_at=_now_ms(),
+            duration_ms=duration_ms,
+            progress=f"{len(parsed_list)}/{len(patent_paths)}",
+            progress_done=len(parsed_list),
+            progress_total=len(patent_paths),
+            patents=patents_result,
+            errors=errors,
+        )
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - started_mono) * 1000)
+        await _update_job(
+            job_id,
+            status="failed",
+            detail="预处理失败",
+            finished_at=_now_ms(),
+            duration_ms=duration_ms,
+            error=str(exc),
+        )
+
+
+@app.post("/api/preprocess")
+async def preprocess_upload(
+    patent_files: list[UploadFile] = File(default_factory=list),
+    model: str = Form(default=""),
+) -> dict[str, Any]:
+    if not patent_files:
+        raise HTTPException(status_code=400, detail="patent_files is empty")
+
+    temp_root = Path(tempfile.mkdtemp(prefix="patent_preprocess_")).resolve()
+    patents_dir = temp_root / "patents"
+    patents_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[str] = []
+    patent_meta: list[dict[str, str]] = []
+
+    try:
+        for idx, item in enumerate(patent_files, start=1):
+            rel = _safe_relative_path(item.filename or f"patent-{idx}")
+            target = patents_dir / rel.name
+            _save_upload_file(item, target)
+            saved_paths.append(str(target))
+            patent_meta.append({
+                "uploaded_name": rel.name,
+                "file_name": target.name,
+            })
+
+        if not saved_paths:
+            raise HTTPException(status_code=400, detail="no usable patent files uploaded")
+
+        job_id = uuid.uuid4().hex
+        job_payload: dict[str, Any] = {
+            "job_id": job_id,
+            "type": "preprocess",
+            "status": "queued",
+            "detail": "预处理任务已提交",
+            "created_at": _now_ms(),
+            "started_at": None,
+            "finished_at": None,
+            "duration_ms": None,
+            "progress": f"0/{len(saved_paths)}",
+            "progress_done": 0,
+            "progress_total": len(saved_paths),
+            "patents": [],
+            "errors": [],
+            "error": None,
+            "patent_meta": patent_meta,
+        }
+        await _store_job(job_payload)
+        asyncio.create_task(
+            _run_preprocess_job(
+                job_id=job_id,
+                patent_paths=saved_paths,
+                model=model.strip() or None,
+                temp_root=temp_root,
+            )
+        )
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "detail": "预处理任务已提交",
+            "patent_count": len(saved_paths),
+        }
+    except HTTPException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"preprocess upload failed: {exc}") from exc
+
+
+@app.get("/api/preprocess/{job_id}")
+async def get_preprocess_status(job_id: str) -> dict[str, Any]:
     await _cleanup_jobs()
     job = await _get_job(job_id)
     if job is None:
