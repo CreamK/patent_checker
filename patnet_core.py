@@ -338,12 +338,59 @@ class SimpleClaudeCodeClient:
         """On Windows, .cmd files can't be exec'd by anyio.open_process.
         Try to find a real .exe alternative."""
         try:
+            # 1. Check .exe sibling in same directory (e.g. claude.exe next to claude.cmd)
             exe_sibling = Path(cmd_path).with_suffix(".exe")
             if exe_sibling.exists():
                 return str(exe_sibling)
+
+            # 2. Check SDK bundled binary
+            try:
+                import claude_agent_sdk
+                bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude.exe"
+                if bundled.exists():
+                    return str(bundled)
+            except Exception:
+                pass
+
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _make_windows_cmd_transport(options: Any, cmd_cli_path: str) -> Any:
+        """Create a custom transport that wraps .cmd with cmd.exe /c on Windows.
+        Falls back to None if SDK internals aren't accessible."""
+        try:
+            from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+            class _WindowsCmdTransport(SubprocessCLITransport):
+                """Override _build_command to prepend cmd.exe /c for .cmd files."""
+
+                def __init__(self, prompt: Any, options: Any, cmd_path: str):
+                    self._cmd_path = cmd_path
+                    super().__init__(prompt=prompt, options=options)
+                    self._cli_path = cmd_path
+
+                def _build_command(self) -> list[str]:
+                    cmd = super()._build_command()
+                    if cmd and cmd[0].lower().endswith((".cmd", ".bat")):
+                        cmd = ["cmd.exe", "/c"] + cmd
+                    return cmd
+
+            async def _empty_stream():
+                return
+                yield {}  # type: ignore[unreachable]
+
+            transport = _WindowsCmdTransport(
+                prompt=_empty_stream(),
+                options=options,
+                cmd_path=cmd_cli_path,
+            )
+            print(f"[claude] Windows: using cmd.exe /c transport for {cmd_cli_path}")
+            return transport
+        except Exception as exc:
+            print(f"[warn] Windows: failed to create cmd transport: {exc}")
+            return None
 
     def check_available(self) -> tuple[bool, str]:
         cli_path = self._resolve_claude_cli_path()
@@ -388,39 +435,54 @@ class SimpleClaudeCodeClient:
         if not cli_path:
             raise RuntimeError("claude CLI not found")
 
-        # On Windows, .cmd/.bat can't be exec'd directly by SDK's anyio.open_process.
-        # The SDK's bundled claude.exe (inside claude_agent_sdk/_bundled/) is used
-        # automatically by the SDK when available — which is the common case.
-        # If only a .cmd is found, try to find an .exe alternative.
-        effective_cli_path = cli_path
-        if self._is_windows() and cli_path.lower().endswith((".cmd", ".bat")):
-            resolved_exe = self._resolve_cmd_to_exe(cli_path)
-            if resolved_exe:
-                print(f"[claude] Windows: resolved .cmd -> .exe: {resolved_exe}")
-                effective_cli_path = resolved_exe
-            else:
-                print(f"[warn] Windows: only .cmd found ({cli_path}). "
-                      f"SDK will use its bundled claude.exe if available. "
-                      f"If this fails, set CLAUDE_CODE_CLI_PATH to a .exe binary.")
-
         env: dict[str, str] = {}
         if self.anthropic_api_key and not self.anthropic_api_key.startswith("sk-ant-xxx"):
             env["ANTHROPIC_API_KEY"] = self.anthropic_api_key
         if self.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = self.anthropic_base_url
 
-        options = ClaudeAgentOptions(
-            permission_mode="bypassPermissions",
-            cwd=str(workspace_path.resolve()),
-            model=self.model,
-            system_prompt=system_prompt,
-            env=env,
-            setting_sources=["user", "project"],
-            cli_path=effective_cli_path,
-        )
+        # On Windows, .cmd/.bat can't be exec'd by SDK's anyio.open_process
+        # (it uses CreateProcessW which doesn't handle .cmd).
+        # Resolution order:
+        #   1. Find a real .exe (sibling or SDK bundled) → pass as cli_path
+        #   2. No .exe found → don't pass cli_path, let SDK find its own bundled binary
+        #   3. Still fails → use custom transport that wraps with cmd.exe /c
+        effective_cli_path: str | None = cli_path
+        use_cmd_transport = False
+
+        if self._is_windows() and cli_path.lower().endswith((".cmd", ".bat")):
+            resolved_exe = self._resolve_cmd_to_exe(cli_path)
+            if resolved_exe:
+                print(f"[claude] Windows: resolved .cmd -> .exe: {resolved_exe}")
+                effective_cli_path = resolved_exe
+            else:
+                # Don't pass .cmd path; let SDK try its bundled binary first.
+                # If SDK has no bundled binary, we'll use a custom transport.
+                print(f"[claude] Windows: .cmd found ({cli_path}), "
+                      f"will try SDK bundled binary or cmd.exe /c fallback")
+                effective_cli_path = None
+                use_cmd_transport = True
+
+        opts_kwargs: dict[str, Any] = {
+            "permission_mode": "bypassPermissions",
+            "cwd": str(workspace_path.resolve()),
+            "model": self.model,
+            "system_prompt": system_prompt,
+            "env": env,
+            "setting_sources": ["user", "project"],
+        }
+        if effective_cli_path:
+            opts_kwargs["cli_path"] = effective_cli_path
+
+        options = ClaudeAgentOptions(**opts_kwargs)
+
+        # On Windows with .cmd only: create a custom transport that wraps with cmd.exe /c
+        custom_transport = None
+        if use_cmd_transport and effective_cli_path is None:
+            custom_transport = self._make_windows_cmd_transport(options, cli_path)
 
         parts: list[str] = []
-        sdk_client = ClaudeSDKClient(options=options)
+        sdk_client = ClaudeSDKClient(options=options, transport=custom_transport)
         session_id = str(uuid.uuid4())
         msg_count = 0
         t_start = time.monotonic()
