@@ -288,14 +288,61 @@ class SimpleClaudeCodeClient:
         self.anthropic_api_key = anthropic_api_key or (os.getenv("ANTHROPIC_API_KEY") or "").strip()
         self.anthropic_base_url = anthropic_base_url or (os.getenv("ANTHROPIC_BASE_URL") or "").strip()
 
+    @staticmethod
+    def _is_windows() -> bool:
+        return sys.platform == "win32"
+
     def _resolve_claude_cli_path(self) -> str | None:
         configured = (os.getenv("CLAUDE_CODE_CLI_PATH") or "").strip().strip('"').strip("'")
         if configured:
             return configured
-        for candidate in ("claude", "claude.exe", "claude.cmd"):
+
+        # On Windows, prefer .exe (which anyio.open_process can exec directly)
+        # over .cmd (which needs cmd.exe /c and may fail with SDK's subprocess)
+        candidates = ["claude"]
+        if self._is_windows():
+            candidates = ["claude.exe", "claude.cmd", "claude"]
+
+        for candidate in candidates:
             resolved = which(candidate)
             if resolved:
                 return resolved
+
+        # Windows-specific fallback paths
+        if self._is_windows():
+            home = Path.home()
+            appdata = os.getenv("APPDATA", "")
+            localappdata = os.getenv("LOCALAPPDATA", "")
+            win_paths = [
+                Path(localappdata) / "Programs" / "claude" / "claude.exe" if localappdata else None,
+                Path(appdata) / "npm" / "claude.cmd" if appdata else None,
+                home / "AppData" / "Roaming" / "npm" / "claude.cmd",
+                home / "node_modules" / ".bin" / "claude.cmd",
+                home / ".claude" / "local" / "claude.exe",
+            ]
+            for p in win_paths:
+                if p and p.exists() and p.is_file():
+                    return str(p)
+
+        return None
+
+    @staticmethod
+    def _build_subprocess_cmd(cli_path: str, args: list[str]) -> list[str]:
+        """Wrap .cmd/.bat in cmd.exe /c on Windows for proper execution."""
+        if sys.platform == "win32" and cli_path.lower().endswith((".cmd", ".bat")):
+            return ["cmd.exe", "/c", cli_path] + args
+        return [cli_path] + args
+
+    @staticmethod
+    def _resolve_cmd_to_exe(cmd_path: str) -> str | None:
+        """On Windows, .cmd files can't be exec'd by anyio.open_process.
+        Try to find a real .exe alternative."""
+        try:
+            exe_sibling = Path(cmd_path).with_suffix(".exe")
+            if exe_sibling.exists():
+                return str(exe_sibling)
+        except Exception:
+            pass
         return None
 
     def check_available(self) -> tuple[bool, str]:
@@ -303,8 +350,9 @@ class SimpleClaudeCodeClient:
         if not cli_path:
             return False, "claude CLI not found in PATH and CLAUDE_CODE_CLI_PATH not set"
         try:
+            cmd = self._build_subprocess_cmd(cli_path, ["--version"])
             completed = subprocess.run(
-                [cli_path, "--version"],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -340,6 +388,21 @@ class SimpleClaudeCodeClient:
         if not cli_path:
             raise RuntimeError("claude CLI not found")
 
+        # On Windows, .cmd/.bat can't be exec'd directly by SDK's anyio.open_process.
+        # The SDK's bundled claude.exe (inside claude_agent_sdk/_bundled/) is used
+        # automatically by the SDK when available — which is the common case.
+        # If only a .cmd is found, try to find an .exe alternative.
+        effective_cli_path = cli_path
+        if self._is_windows() and cli_path.lower().endswith((".cmd", ".bat")):
+            resolved_exe = self._resolve_cmd_to_exe(cli_path)
+            if resolved_exe:
+                print(f"[claude] Windows: resolved .cmd -> .exe: {resolved_exe}")
+                effective_cli_path = resolved_exe
+            else:
+                print(f"[warn] Windows: only .cmd found ({cli_path}). "
+                      f"SDK will use its bundled claude.exe if available. "
+                      f"If this fails, set CLAUDE_CODE_CLI_PATH to a .exe binary.")
+
         env: dict[str, str] = {}
         if self.anthropic_api_key and not self.anthropic_api_key.startswith("sk-ant-xxx"):
             env["ANTHROPIC_API_KEY"] = self.anthropic_api_key
@@ -348,12 +411,12 @@ class SimpleClaudeCodeClient:
 
         options = ClaudeAgentOptions(
             permission_mode="bypassPermissions",
-            cwd=workspace_path.resolve(),
+            cwd=str(workspace_path.resolve()),
             model=self.model,
             system_prompt=system_prompt,
             env=env,
             setting_sources=["user", "project"],
-            cli_path=cli_path,
+            cli_path=effective_cli_path,
         )
 
         parts: list[str] = []
@@ -543,6 +606,12 @@ def read_docx_text(path: Path) -> str:
 
 
 def read_doc_text(path: Path) -> str:
+    # Strategy 1: olefile — pure-Python, cross-platform .doc parser
+    text = _read_doc_via_olefile(path)
+    if text:
+        return text
+
+    # Strategy 2: antiword / catdoc — Unix CLI tools
     for tool in ("antiword", "catdoc"):
         if not shutil.which(tool):
             continue
@@ -559,12 +628,71 @@ def read_doc_text(path: Path) -> str:
         if completed.returncode == 0 and output:
             return output
 
+    # Strategy 3: raw read as fallback
     try:
         content = path.read_text(encoding="utf-8", errors="ignore").strip()
         if content and "\x00" not in content:
             return content
     except Exception:
         return ""
+    return ""
+
+
+def _read_doc_via_olefile(path: Path) -> str:
+    """Extract text from .doc (OLE2/CFBF) using olefile — works on all platforms."""
+    try:
+        import olefile  # type: ignore
+    except ImportError:
+        return ""
+
+    if not olefile.isOleFile(str(path)):
+        return ""
+
+    try:
+        ole = olefile.OleFileIO(str(path))
+    except Exception:
+        return ""
+
+    try:
+        if not ole.exists("WordDocument"):
+            return ""
+
+        # The main text is stored in the "WordDocument" stream, but the raw
+        # bytes need the "1Table" or "0Table" stream to decode properly.
+        # A simpler cross-platform approach: read all text-bearing streams
+        # and extract printable content.
+        raw_parts: list[str] = []
+
+        for stream_name in ("WordDocument", "1Table", "0Table"):
+            if not ole.exists(stream_name):
+                continue
+            try:
+                data = ole.openstream(stream_name).read()
+            except Exception:
+                continue
+
+            # Try UTF-16-LE first (common in .doc), then CP1252, then UTF-8
+            for encoding in ("utf-16-le", "cp1252", "utf-8"):
+                try:
+                    decoded = data.decode(encoding, errors="ignore")
+                    # Keep only printable chars and common whitespace
+                    cleaned = re.sub(r"[^\x20-\x7E\u4E00-\u9FFF\u3000-\u303F"
+                                     r"\uFF00-\uFFEF\u00A0-\u024F\n\r\t]", " ", decoded)
+                    cleaned = re.sub(r"[ \t]{3,}", " ", cleaned)
+                    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+                    cleaned = cleaned.strip()
+                    if len(cleaned) > 100:
+                        raw_parts.append(cleaned)
+                        break
+                except Exception:
+                    continue
+
+        if raw_parts:
+            best = max(raw_parts, key=len)
+            return best
+    finally:
+        ole.close()
+
     return ""
 
 

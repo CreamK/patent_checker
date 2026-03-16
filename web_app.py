@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -131,10 +132,35 @@ async def _cleanup_jobs() -> None:
             JOBS.pop(job_id, None)
 
 
+class _TeeWriter:
+    """Write to both an in-memory buffer and the original stream (real-time)."""
+
+    def __init__(self, buffer: io.StringIO, original: Any):
+        self._buffer = buffer
+        self._original = original
+
+    def write(self, s: str) -> int:
+        self._buffer.write(s)
+        if self._original:
+            self._original.write(s)
+            self._original.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        self._buffer.flush()
+        if self._original:
+            self._original.flush()
+
+
 async def _run_core_patent_check(options: PatentCheckOptions) -> tuple[int, str, str, dict[str, Any] | None]:
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+    real_stdout = sys.stdout
+    real_stderr = sys.stderr
+    tee_out = _TeeWriter(stdout_buffer, real_stdout)
+    tee_err = _TeeWriter(stderr_buffer, real_stderr)
+
+    with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
         exit_code = await run_patent_check(options)
 
     result_json: dict[str, Any] | None = None
