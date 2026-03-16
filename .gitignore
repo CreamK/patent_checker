@@ -1,5 +1,7 @@
 __pycache__/
+.patent_cache/
 
 .DS_Store
 
 result.json
+
