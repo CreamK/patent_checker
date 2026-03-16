@@ -1,0 +1,954 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Patent Check Web</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg-0: #f4f7f2;
+        --bg-1: #dbe8dc;
+        --ink: #13271d;
+        --ink-soft: #476052;
+        --accent: #0d7a5f;
+        --warn: #ea6f2d;
+        --err: #d63c3c;
+        --card: rgba(255, 255, 255, 0.78);
+        --line: rgba(16, 42, 33, 0.15);
+        --mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+        --sans: 'Space Grotesk', 'Avenir Next', 'Segoe UI', sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: var(--sans);
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 15% 20%, rgba(234, 111, 45, 0.12) 0, transparent 35%),
+          radial-gradient(circle at 90% 12%, rgba(13, 122, 95, 0.18) 0, transparent 30%),
+          linear-gradient(145deg, var(--bg-0), var(--bg-1));
+      }
+
+      .shell {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      .hero {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+
+      .title {
+        margin: 0;
+        font-size: clamp(28px, 4vw, 42px);
+        letter-spacing: -0.02em;
+      }
+
+      .subtitle {
+        margin: 6px 0 0;
+        color: var(--ink-soft);
+      }
+
+      .status-chip {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 18px;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        background: var(--card);
+        border-radius: 16px;
+        backdrop-filter: blur(6px);
+        box-shadow: 0 12px 28px rgba(18, 39, 31, 0.08);
+      }
+
+      .panel .head {
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--line);
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+
+      .panel .body {
+        padding: 16px 18px 18px;
+      }
+
+      label {
+        display: block;
+        font-size: 12px;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+        color: var(--ink-soft);
+        margin: 10px 0 6px;
+      }
+
+      input,
+      select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--ink);
+        padding: 10px 12px;
+        font-size: 14px;
+        font-family: var(--sans);
+      }
+
+      input[type='file'] {
+        padding: 10px;
+      }
+
+      .select-box {
+        border: 1px dashed var(--line);
+        border-radius: 12px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.55);
+      }
+
+      .selected {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--ink-soft);
+        line-height: 1.45;
+      }
+
+      .inline-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .btn {
+        margin-top: 14px;
+        width: 100%;
+        border: 0;
+        border-radius: 12px;
+        padding: 12px 14px;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        color: #fff;
+        background: linear-gradient(95deg, var(--accent), #23a882);
+        transition: transform 120ms ease, opacity 120ms ease;
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .btn:disabled {
+        cursor: not-allowed;
+        opacity: 0.65;
+      }
+
+      .muted {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.75);
+      }
+
+      .card .k {
+        font-size: 11px;
+        color: var(--ink-soft);
+        text-transform: none;
+      }
+
+      .card .v {
+        margin-top: 6px;
+        font-size: 22px;
+        font-weight: 700;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+        text-align: left;
+        padding: 8px 6px;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--ink-soft);
+      }
+
+      .code {
+        font-family: var(--mono);
+        background: #0f221b;
+        color: #defff2;
+        border-radius: 12px;
+        padding: 12px;
+        max-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+
+      .hint {
+        font-size: 12px;
+        color: var(--ink-soft);
+        margin-bottom: 10px;
+      }
+
+      .label-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .info-dot {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--ink-soft);
+        font-family: var(--mono);
+        font-size: 10px;
+        font-weight: 600;
+        cursor: help;
+      }
+
+      .info-dot::after {
+        content: attr(data-tip);
+        position: absolute;
+        left: 50%;
+        top: calc(100% + 8px);
+        transform: translateX(-50%);
+        width: 260px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #0f221b;
+        color: #defff2;
+        text-transform: none;
+        letter-spacing: 0;
+        line-height: 1.4;
+        font-size: 11px;
+        font-weight: 400;
+        white-space: normal;
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 120ms ease, visibility 120ms ease;
+        pointer-events: none;
+        z-index: 8;
+      }
+
+      .info-dot:hover::after,
+      .info-dot:focus-visible::after {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .input-trace {
+        margin-bottom: 12px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.66);
+      }
+
+      .trace-title {
+        font-size: 12px;
+        text-transform: uppercase;
+        color: var(--ink-soft);
+        margin-bottom: 6px;
+      }
+
+      .trace-body {
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .trace-body code {
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="hero">
+        <div>
+          <h1 class="title">Patent Check Console</h1>
+          <p class="subtitle">仓库目录 + 专利文件选择上传，执行并可视化展示结果。</p>
+        </div>
+        <div id="status-chip" class="status-chip">当前扫描状态：空闲</div>
+      </div>
+
+      <div class="layout">
+        <section class="panel">
+          <div class="head">输入参数</div>
+          <div class="body">
+            <label>仓库目录（选择整个项目文件夹）</label>
+            <div class="select-box">
+              <input id="repo-picker" type="file" webkitdirectory directory multiple />
+              <div id="repo-selected" class="selected">未选择</div>
+            </div>
+
+            <label>专利文件（可多选）</label>
+            <div class="select-box">
+              <input
+                id="patent-picker"
+                type="file"
+                multiple
+                accept=".pdf,.doc,.docx,.txt,.md,.json,.xml,.html,.htm"
+              />
+              <div id="patent-selected" class="selected">未选择</div>
+            </div>
+
+            <div class="inline-grid">
+              <div>
+                <label for="timeout">
+                  <span class="label-row">
+                    超时时间（秒）
+                    <span
+                      class="info-dot"
+                      tabindex="0"
+                      data-tip="每次调用云端分析（scanner 或 validator）的最大等待时间。超时会导致本轮失败。单位：秒。"
+                      >?</span
+                    >
+                  </span>
+                </label>
+                <input id="timeout" type="number" value="600" min="30" step="10" />
+              </div>
+              <div>
+                <label for="model">
+                  <span class="label-row">
+                    模型（可选）
+                    <span
+                      class="info-dot"
+                      tabindex="0"
+                      data-tip="覆盖默认 Claude 模型，例如 sonnet 或 opus。留空则使用本地 Claude 默认模型。"
+                      >?</span
+                    >
+                  </span>
+                </label>
+                <input id="model" placeholder="opus / sonnet ..." />
+              </div>
+            </div>
+
+            <div>
+              <div>
+                <label for="max-patterns">
+                  <span class="label-row">
+                    最大模式数
+                    <span
+                      class="info-dot"
+                      tabindex="0"
+                      data-tip="scanner 输出后保留的技术模式上限（仅保留评分 >= 8 的模式）。"
+                      >?</span
+                    >
+                  </span>
+                </label>
+                <input id="max-patterns" type="number" value="30" min="1" />
+              </div>
+            </div>
+
+            <div>
+              <label for="max-matches">
+                <span class="label-row">
+                  最大匹配数
+                  <span
+                    class="info-dot"
+                    tabindex="0"
+                    data-tip="validator 结果保留上限，按相似度从高到低排序后截断。"
+                    >?</span
+                  >
+                </span>
+              </label>
+              <input id="max-matches" type="number" value="50" min="1" />
+            </div>
+
+            <button id="run-btn" class="btn">运行扫描</button>
+            <div class="muted">路径不手输，直接从选择器导入。</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="head">输出结果</div>
+          <div class="body">
+            <div class="cards" id="summary-cards"></div>
+            <div class="hint" id="detail-text">等待执行</div>
+            <div class="input-trace">
+              <div class="trace-title">本次扫描输入</div>
+              <div class="trace-body" id="scan-input-box">尚未执行</div>
+            </div>
+
+            <div class="row">
+              <div>
+                <h4>Patterns</h4>
+                <div style="overflow:auto; max-height: 240px;">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Title</th>
+                        <th>Score</th>
+                      </tr>
+                    </thead>
+                    <tbody id="patterns-table"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h4>Matches</h4>
+                <div style="overflow:auto; max-height: 240px;">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Patent</th>
+                        <th>Pattern</th>
+                        <th>Level</th>
+                        <th>Similarity</th>
+                      </tr>
+                    </thead>
+                    <tbody id="matches-table"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <h4>按专利汇总</h4>
+            <div style="overflow:auto; max-height: 200px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Patent</th>
+                    <th>Matches</th>
+                    <th>Max Similarity</th>
+                  </tr>
+                </thead>
+                <tbody id="patent-groups-table"></tbody>
+              </table>
+            </div>
+
+            <h4>STDOUT</h4>
+            <div id="stdout-box" class="code">-</div>
+            <h4>STDERR</h4>
+            <div id="stderr-box" class="code">-</div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const ui = {
+        repoPicker: document.getElementById('repo-picker'),
+        repoSelected: document.getElementById('repo-selected'),
+        patentPicker: document.getElementById('patent-picker'),
+        patentSelected: document.getElementById('patent-selected'),
+        timeout: document.getElementById('timeout'),
+        model: document.getElementById('model'),
+        maxPatterns: document.getElementById('max-patterns'),
+        maxMatches: document.getElementById('max-matches'),
+        runBtn: document.getElementById('run-btn'),
+        statusChip: document.getElementById('status-chip'),
+        detailText: document.getElementById('detail-text'),
+        summaryCards: document.getElementById('summary-cards'),
+        patternsTable: document.getElementById('patterns-table'),
+        matchesTable: document.getElementById('matches-table'),
+        patentGroupsTable: document.getElementById('patent-groups-table'),
+        scanInputBox: document.getElementById('scan-input-box'),
+        stdoutBox: document.getElementById('stdout-box'),
+        stderrBox: document.getElementById('stderr-box'),
+      }
+      const ACTIVE_JOB_KEY = 'patent_check_active_job_id'
+      let activeJobId = ''
+      let pollTimerId = null
+
+      function setRunBusy(isBusy) {
+        ui.runBtn.disabled = isBusy
+      }
+
+      function saveActiveJob(jobId) {
+        const token = String(jobId || '').trim()
+        if (!token) return
+        activeJobId = token
+        localStorage.setItem(ACTIVE_JOB_KEY, token)
+      }
+
+      function clearActiveJob() {
+        activeJobId = ''
+        localStorage.removeItem(ACTIVE_JOB_KEY)
+      }
+
+      function getSavedActiveJob() {
+        return String(localStorage.getItem(ACTIVE_JOB_KEY) || '').trim()
+      }
+
+      function stopPolling() {
+        if (pollTimerId !== null) {
+          clearTimeout(pollTimerId)
+          pollTimerId = null
+        }
+      }
+
+      function setStatus(text, tone = 'idle') {
+        ui.statusChip.textContent = `当前扫描状态：${text}`
+        ui.statusChip.style.borderColor = 'var(--line)'
+        if (tone === 'run') ui.statusChip.style.borderColor = '#23a882'
+        if (tone === 'ok') ui.statusChip.style.borderColor = '#0d7a5f'
+        if (tone === 'warn') ui.statusChip.style.borderColor = '#ea6f2d'
+        if (tone === 'err') ui.statusChip.style.borderColor = '#d63c3c'
+      }
+
+      function renderSummary(summary = {}) {
+        const thresholdRaw = Number(summary.hit_similarity_threshold)
+        const hitThreshold = Number.isFinite(thresholdRaw) ? thresholdRaw : 0.5
+        const hitThresholdText = hitThreshold.toFixed(2)
+        const metrics = [
+          {
+            key: 'patterns',
+            label: '技术模式数',
+            tip: '扫描阶段提炼出的模式数量（当前仅统计评分大于等于 8 的模式）。',
+          },
+          {
+            key: 'matches',
+            label: '匹配条目数',
+            tip: '模式与专利两两比对后得到的匹配记录总数。',
+          },
+          {
+            key: 'actionable_matches',
+            label: '重点关注数',
+            tip: '建议优先核查的匹配数量：高匹配，或中匹配且相似度较高。',
+          },
+          {
+            key: 'files_analyzed',
+            label: '已分析源码文件',
+            tip: 'scanner 报告的实际参与分析的源码文件数量。',
+          },
+          {
+            key: 'matched_patent_files',
+            label: '命中专利数',
+            tip: `上传专利中，最大相似度达到 ${hitThresholdText} 及以上的专利文件数量。`,
+          },
+          {
+            key: 'unmatched_patent_files',
+            label: '未命中专利数',
+            tip: `上传专利中，最大相似度低于 ${hitThresholdText} 的专利文件数量。`,
+          },
+        ]
+        ui.summaryCards.innerHTML = metrics
+          .map((item) => {
+            const value = summary[item.key] ?? 0
+            const tip = String(item.tip || '')
+              .replaceAll('&', '&amp;')
+              .replaceAll('"', '&quot;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;')
+            return `<div class="card">
+              <div class="k">
+                <span class="label-row">
+                  ${item.label}
+                  <span class="info-dot" tabindex="0" data-tip="${tip}">?</span>
+                </span>
+              </div>
+              <div class="v">${value}</div>
+            </div>`
+          })
+          .join('')
+      }
+
+      function renderPatterns(patterns = []) {
+        if (!patterns.length) {
+          ui.patternsTable.innerHTML = '<tr><td colspan="3">-</td></tr>'
+          return
+        }
+        ui.patternsTable.innerHTML = patterns
+          .slice(0, 20)
+          .map(
+            (p) => `<tr>
+              <td>${p.pattern_id || '-'}</td>
+              <td>${p.title || '-'}</td>
+              <td>${p.score_total ?? '-'}</td>
+            </tr>`,
+          )
+          .join('')
+      }
+
+      function fileBaseName(pathLike = '') {
+        const token = String(pathLike || '').trim()
+        if (!token) return ''
+        const chunks = token.split(/[\\\\/]/)
+        return chunks[chunks.length - 1] || token
+      }
+
+      function buildPatentLookup(usedInputs = null, result = {}) {
+        const lookup = new Map()
+
+        const used = Array.isArray(usedInputs?.patents) ? usedInputs.patents : []
+        for (const item of used) {
+          const fileName = item.file_name || item.uploaded_name || ''
+          if (!fileName) continue
+          const display = item.title
+            ? `${fileName} | ${item.title}`
+            : (item.uploaded_name || fileName)
+          lookup.set(fileName, display)
+        }
+
+        const resultPatents = Array.isArray(result?.patents) ? result.patents : []
+        for (const item of resultPatents) {
+          const fileName = fileBaseName(item.path || '')
+          if (!fileName) continue
+          const title = String(item.title || '').trim()
+          if (!lookup.has(fileName)) {
+            lookup.set(fileName, title ? `${fileName} | ${title}` : fileName)
+          }
+        }
+
+        return lookup
+      }
+
+      function resolvePatentLabel(match = {}, patentLookup = new Map()) {
+        const title = String(match.patent_title || '').trim()
+        if (title) return title
+        const fileName = fileBaseName(match.patent_file || '')
+        if (!fileName) return '-'
+        return patentLookup.get(fileName) || fileName
+      }
+
+      function renderMatches(matches = [], patentLookup = new Map()) {
+        if (!matches.length) {
+          ui.matchesTable.innerHTML = '<tr><td colspan="4">-</td></tr>'
+          return
+        }
+        ui.matchesTable.innerHTML = matches
+          .slice(0, 30)
+          .map(
+            (m) => `<tr>
+              <td>${resolvePatentLabel(m, patentLookup)}</td>
+              <td>${m.pattern_title || m.pattern_id || '-'}</td>
+              <td>${m.match_level || '-'}</td>
+              <td>${typeof m.similarity === 'number' ? m.similarity.toFixed(2) : '-'}</td>
+            </tr>`,
+          )
+          .join('')
+      }
+
+      function renderPatentGroups(groups = [], patentLookup = new Map()) {
+        if (!groups.length) {
+          ui.patentGroupsTable.innerHTML = '<tr><td colspan="3">-</td></tr>'
+          return
+        }
+        ui.patentGroupsTable.innerHTML = groups
+          .slice(0, 20)
+          .map((g) => {
+            const fileName = fileBaseName(g.patent_file || '')
+            const fallback = g.patent_title || fileName || '-'
+            const label = patentLookup.get(fileName) || fallback
+            const maxSim =
+              typeof g.max_similarity === 'number' ? g.max_similarity.toFixed(2) : '-'
+            return `<tr>
+              <td>${label}</td>
+              <td>${g.match_count ?? '-'}</td>
+              <td>${maxSim}</td>
+            </tr>`
+          })
+          .join('')
+      }
+
+      function renderUsedInputs(usedInputs = null, fallbackRepo = '', fallbackPatents = []) {
+        const repoLabel = usedInputs?.repo_label || fallbackRepo || '-'
+        const repoFileCount = usedInputs?.repo_file_count
+        const patents = Array.isArray(usedInputs?.patents)
+          ? usedInputs.patents
+          : fallbackPatents.map((name) => ({ file_name: name, uploaded_name: name, title: null }))
+
+        const patentLines = patents.length
+          ? patents
+              .map((item, idx) => {
+                const fileName = item.file_name || item.uploaded_name || '-'
+                const title = item.title ? ` | 标题: ${item.title}` : ''
+                return `${idx + 1}. <code>${fileName}</code>${title}`
+              })
+              .join('<br/>')
+          : '-'
+
+        const repoCountText = typeof repoFileCount === 'number' ? ` (files=${repoFileCount})` : ''
+        ui.scanInputBox.innerHTML = `仓库: <code>${repoLabel}</code>${repoCountText}<br/>专利: <br/>${patentLines}`
+      }
+
+      function renderCompletedJob(data = {}) {
+        const result = data.result_json || {}
+        const summary = result.summary || {}
+        const patentLookup = buildPatentLookup(data.used_inputs || null, result)
+        renderSummary(summary)
+        renderPatterns(result.patterns || [])
+        renderMatches(result.matches || [], patentLookup)
+        renderPatentGroups(result.patent_groups || [], patentLookup)
+
+        const exitCode = Number(data.exit_code)
+        if (exitCode === 0) setStatus('通过（0）', 'ok')
+        else if (exitCode === 10 || exitCode === 11) setStatus(`告警（${exitCode}）`, 'warn')
+        else setStatus(`失败（${Number.isFinite(exitCode) ? exitCode : '-'})`, 'err')
+
+        const stat = data.upload_stats || {}
+        renderUsedInputs(data.used_inputs || null, '', [])
+        ui.detailText.textContent =
+          (result.detail || '无结构化 detail') +
+          ` | ${data.duration_ms || data.elapsed_ms || 0} ms | repo_files=${stat.repo_files || 0}, patent_files=${stat.patent_files || 0}`
+        ui.stdoutBox.textContent = data.stdout || '-'
+        ui.stderrBox.textContent = data.stderr || '-'
+      }
+
+      function renderRunningJob(data = {}) {
+        setStatus('扫描中', 'run')
+        const stat = data.upload_stats || {}
+        const elapsedMs = Number(data.elapsed_ms || 0)
+        renderUsedInputs(data.used_inputs || null, '', [])
+        ui.detailText.textContent =
+          (data.detail || '扫描任务执行中') +
+          ` | ${Number.isFinite(elapsedMs) ? elapsedMs : 0} ms | repo_files=${stat.repo_files || 0}, patent_files=${stat.patent_files || 0}`
+        if (!ui.stdoutBox.textContent || ui.stdoutBox.textContent === '-') {
+          ui.stdoutBox.textContent = '(任务运行中，完成后展示)'
+        }
+      }
+
+      async function pollJobStatus(jobId) {
+        const token = String(jobId || '').trim()
+        if (!token) return
+        stopPolling()
+        setRunBusy(true)
+        saveActiveJob(token)
+
+        const tick = async () => {
+          try {
+            const resp = await fetch(`/api/run-upload/${encodeURIComponent(token)}`)
+            const data = await resp.json()
+            if (!resp.ok) {
+              throw new Error(data.detail || '状态查询失败')
+            }
+
+            const status = String(data.status || '').toLowerCase()
+            if (status === 'queued' || status === 'running') {
+              renderRunningJob(data)
+              pollTimerId = setTimeout(tick, 1500)
+              return
+            }
+            if (status === 'completed') {
+              renderCompletedJob(data)
+              clearActiveJob()
+              stopPolling()
+              setRunBusy(false)
+              return
+            }
+            if (status === 'failed') {
+              setStatus('失败', 'err')
+              renderUsedInputs(data.used_inputs || null, '', [])
+              ui.detailText.textContent = data.error || data.detail || '扫描任务失败'
+              ui.stdoutBox.textContent = data.stdout || '-'
+              ui.stderrBox.textContent = data.stderr || '-'
+              clearActiveJob()
+              stopPolling()
+              setRunBusy(false)
+              return
+            }
+
+            throw new Error(`未知任务状态: ${status || '-'}`)
+          } catch (err) {
+            const message = String(err)
+            if (message.includes('job not found') || message.includes('expired')) {
+              clearActiveJob()
+              stopPolling()
+              setRunBusy(false)
+              setStatus('空闲', 'idle')
+              ui.detailText.textContent = '未找到进行中的任务，请重新发起扫描。'
+              return
+            }
+            setStatus('请求失败', 'err')
+            ui.detailText.textContent = `状态查询失败：${message}`
+            pollTimerId = setTimeout(tick, 2000)
+          }
+        }
+
+        await tick()
+      }
+
+      function refreshRepoSelected() {
+        const files = Array.from(ui.repoPicker.files || [])
+        if (!files.length) {
+          ui.repoSelected.textContent = '未选择'
+          return
+        }
+        const first = files[0]
+        const root = first.webkitRelativePath ? first.webkitRelativePath.split('/')[0] : first.name
+        ui.repoSelected.textContent = `目录：${root} | 文件数：${files.length}`
+      }
+
+      function refreshPatentSelected() {
+        const files = Array.from(ui.patentPicker.files || [])
+        if (!files.length) {
+          ui.patentSelected.textContent = '未选择'
+          return
+        }
+        ui.patentSelected.textContent = `文件数：${files.length}`
+      }
+
+      async function runScan() {
+        if (activeJobId) {
+          alert('当前已有扫描任务在运行，请等待完成。')
+          return
+        }
+
+        const repoFiles = Array.from(ui.repoPicker.files || [])
+        const patentFiles = Array.from(ui.patentPicker.files || [])
+        if (!repoFiles.length) {
+          alert('请先选择仓库目录')
+          return
+        }
+        if (!patentFiles.length) {
+          alert('请先选择专利文件')
+          return
+        }
+
+        const form = new FormData()
+        for (const file of repoFiles) {
+          const filename = file.webkitRelativePath || file.name
+          form.append('repo_files', file, filename)
+        }
+        for (const file of patentFiles) {
+          form.append('patent_files', file, file.name)
+        }
+
+        form.append('timeout', String(Number(ui.timeout.value) || 600))
+        form.append('model', ui.model.value.trim())
+        form.append('max_patterns', String(Number(ui.maxPatterns.value) || 30))
+        form.append('max_matches', String(Number(ui.maxMatches.value) || 50))
+
+        setRunBusy(true)
+        setStatus('扫描中', 'run')
+        ui.detailText.textContent = '正在上传并创建扫描任务，请稍候...'
+        ui.stdoutBox.textContent = '-'
+        ui.stderrBox.textContent = '-'
+        const repoRoot = repoFiles[0]?.webkitRelativePath
+          ? repoFiles[0].webkitRelativePath.split('/')[0]
+          : 'uploaded-repo'
+        renderUsedInputs(
+          {
+            repo_label: repoRoot,
+            repo_file_count: repoFiles.length,
+            patents: patentFiles.map((f) => ({ file_name: f.name, uploaded_name: f.name, title: null })),
+          },
+          repoRoot,
+          patentFiles.map((f) => f.name),
+        )
+
+        try {
+          const resp = await fetch('/api/run-upload', {
+            method: 'POST',
+            body: form,
+          })
+          const data = await resp.json()
+          if (!resp.ok) {
+            throw new Error(data.detail || 'request failed')
+          }
+          const jobId = String(data.job_id || '').trim()
+          if (!jobId) {
+            throw new Error('服务端未返回任务ID')
+          }
+          renderRunningJob(data)
+          await pollJobStatus(jobId)
+        } catch (err) {
+          setStatus('请求失败', 'err')
+          ui.detailText.textContent = String(err)
+          renderUsedInputs(
+            null,
+            repoFiles[0]?.webkitRelativePath ? repoFiles[0].webkitRelativePath.split('/')[0] : 'uploaded-repo',
+            patentFiles.map((f) => f.name),
+          )
+          renderPatentGroups([], new Map())
+          clearActiveJob()
+          stopPolling()
+          setRunBusy(false)
+        }
+      }
+
+      ui.repoPicker.addEventListener('change', refreshRepoSelected)
+      ui.patentPicker.addEventListener('change', refreshPatentSelected)
+      ui.runBtn.addEventListener('click', runScan)
+      renderSummary({})
+      renderPatterns([])
+      renderMatches([], new Map())
+      renderPatentGroups([], new Map())
+      renderUsedInputs(null, '', [])
+
+      async function resumeActiveJobIfNeeded() {
+        const savedJobId = getSavedActiveJob()
+        if (!savedJobId) {
+          setStatus('空闲', 'idle')
+          setRunBusy(false)
+          return
+        }
+        setStatus('扫描中', 'run')
+        ui.detailText.textContent = '检测到进行中的任务，正在恢复状态...'
+        await pollJobStatus(savedJobId)
+      }
+
+      resumeActiveJobIfNeeded()
+    </script>
+  </body>
+</html>
