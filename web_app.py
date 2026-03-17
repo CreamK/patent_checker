@@ -15,9 +15,23 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.requests import Request as _StarletteRequest
+
+_original_form = _StarletteRequest.form
+
+
+def _form_with_higher_limits(
+    self, *, max_files=50_000, max_fields=50_000, max_part_size=1024 * 1024
+):
+    return _original_form(
+        self, max_files=max_files, max_fields=max_fields, max_part_size=max_part_size
+    )
+
+
+_StarletteRequest.form = _form_with_higher_limits
 
 from patnet_core import (
     PatentCheckOptions,
@@ -38,19 +52,6 @@ WEB_DIR = BASE_DIR / "web"
 CORE_PATH = BASE_DIR / "patnet_core.py"
 
 app = FastAPI(title="Patent Check Web", version="0.1.0")
-
-UPLOAD_MAX_FILES = 50_000
-UPLOAD_MAX_FIELDS = 50_000
-
-
-@app.middleware("http")
-async def _raise_multipart_limits(request: Request, call_next):
-    ct = request.headers.get("content-type", "")
-    if ct.startswith("multipart/form-data"):
-        await request.form(max_files=UPLOAD_MAX_FILES, max_fields=UPLOAD_MAX_FIELDS)
-    response = await call_next(request)
-    return response
-
 
 JOB_TTL_SECONDS = 60 * 60
 JOBS: dict[str, dict[str, Any]] = {}
