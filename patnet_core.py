@@ -708,7 +708,8 @@ def read_doc_text(path: Path) -> str:
 
 
 def _read_doc_via_olefile(path: Path) -> str:
-    """Extract text from .doc (OLE2/CFBF) using olefile — works on all platforms."""
+    """Extract text from .doc (OLE2/CFBF) by parsing the Word Binary piece table.
+    Works on all platforms via olefile (pure Python)."""
     try:
         import olefile  # type: ignore
     except ImportError:
@@ -726,43 +727,121 @@ def _read_doc_via_olefile(path: Path) -> str:
         if not ole.exists("WordDocument"):
             return ""
 
-        # The main text is stored in the "WordDocument" stream, but the raw
-        # bytes need the "1Table" or "0Table" stream to decode properly.
-        # A simpler cross-platform approach: read all text-bearing streams
-        # and extract printable content.
-        raw_parts: list[str] = []
+        word_stream = ole.openstream("WordDocument").read()
+        if len(word_stream) < 12:
+            return ""
 
-        for stream_name in ("WordDocument", "1Table", "0Table"):
-            if not ole.exists(stream_name):
-                continue
-            try:
-                data = ole.openstream(stream_name).read()
-            except Exception:
-                continue
+        # FIB: bytes 0x000A-0x000B → flags; bit 9 of wIdent area tells table name
+        fib_flags = int.from_bytes(word_stream[0x000A:0x000C], "little")
+        table_name = "1Table" if (fib_flags & 0x0200) else "0Table"
 
-            # Try UTF-16-LE first (common in .doc), then CP1252, then UTF-8
-            for encoding in ("utf-16-le", "cp1252", "utf-8"):
-                try:
-                    decoded = data.decode(encoding, errors="ignore")
-                    # Keep only printable chars and common whitespace
-                    cleaned = re.sub(r"[^\x20-\x7E\u4E00-\u9FFF\u3000-\u303F"
-                                     r"\uFF00-\uFFEF\u00A0-\u024F\n\r\t]", " ", decoded)
-                    cleaned = re.sub(r"[ \t]{3,}", " ", cleaned)
-                    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-                    cleaned = cleaned.strip()
-                    if len(cleaned) > 100:
-                        raw_parts.append(cleaned)
-                        break
-                except Exception:
-                    continue
+        if not ole.exists(table_name):
+            return ""
 
-        if raw_parts:
-            best = max(raw_parts, key=len)
-            return best
+        table_stream = ole.openstream(table_name).read()
+
+        # FIB: ccpText at offset 0x004C (4 bytes LE) — character count of main text
+        ccp_text = int.from_bytes(word_stream[0x004C:0x0050], "little")
+        if ccp_text <= 0 or ccp_text > 10_000_000:
+            return ""
+
+        # FIB: fcClx at 0x01A2 (4 bytes), lcbClx at 0x01A6 (4 bytes)
+        fc_clx = int.from_bytes(word_stream[0x01A2:0x01A6], "little")
+        lcb_clx = int.from_bytes(word_stream[0x01A6:0x01AA], "little")
+
+        if fc_clx == 0 or lcb_clx == 0:
+            return ""
+
+        clx = table_stream[fc_clx : fc_clx + lcb_clx]
+
+        # Parse CLX: skip Prcs (type 0x01), find Pcdt (type 0x02)
+        pos = 0
+        while pos < len(clx):
+            clx_type = clx[pos]
+            if clx_type == 0x01:
+                # Prc: 1 byte type + 2 bytes size + data
+                if pos + 3 > len(clx):
+                    break
+                prc_size = int.from_bytes(clx[pos + 1 : pos + 3], "little")
+                pos += 3 + prc_size
+            elif clx_type == 0x02:
+                # Pcdt: 1 byte type + 4 bytes size + PlcPcd
+                if pos + 5 > len(clx):
+                    break
+                pcdt_size = int.from_bytes(clx[pos + 1 : pos + 5], "little")
+                plc_pcd = clx[pos + 5 : pos + 5 + pcdt_size]
+                return _extract_text_from_plcpcd(plc_pcd, ccp_text, word_stream)
+            else:
+                break
+
+    except Exception:
+        pass
     finally:
         ole.close()
 
     return ""
+
+
+def _extract_text_from_plcpcd(
+    plc_pcd: bytes, ccp_text: int, word_stream: bytes
+) -> str:
+    """Parse PlcPcd structure to extract text pieces from WordDocument stream."""
+    # PlcPcd = array of (n+1) CPs (4 bytes each) + array of n PCDs (8 bytes each)
+    # Solve: (n+1)*4 + n*8 = len(plc_pcd) → n = (len(plc_pcd) - 4) / 12
+    n_pieces = (len(plc_pcd) - 4) // 12
+    if n_pieces <= 0:
+        return ""
+
+    cps: list[int] = []
+    for i in range(n_pieces + 1):
+        cp = int.from_bytes(plc_pcd[i * 4 : i * 4 + 4], "little")
+        cps.append(cp)
+
+    pcd_offset = (n_pieces + 1) * 4
+    text_parts: list[str] = []
+
+    for i in range(n_pieces):
+        cp_start = cps[i]
+        cp_end = cps[i + 1]
+        if cp_start >= ccp_text:
+            break
+        cp_end = min(cp_end, ccp_text)
+        char_count = cp_end - cp_start
+
+        pcd_base = pcd_offset + i * 8
+        if pcd_base + 8 > len(plc_pcd):
+            break
+
+        # PCD: 2 bytes abfcNotUsed + 4 bytes fc + 2 bytes prm
+        fc_raw = int.from_bytes(plc_pcd[pcd_base + 2 : pcd_base + 6], "little")
+
+        # Bit 30 of fc → if set, text is CP1252 (1 byte/char); else UTF-16-LE (2 bytes/char)
+        is_ansi = bool(fc_raw & 0x40000000)
+        fc = fc_raw & 0x3FFFFFFF
+
+        if is_ansi:
+            fc = fc // 2  # ANSI offset is halved in the fc field
+            byte_start = fc
+            byte_end = fc + char_count
+            if byte_end > len(word_stream):
+                byte_end = len(word_stream)
+            chunk = word_stream[byte_start:byte_end].decode("cp1252", errors="ignore")
+        else:
+            byte_start = fc
+            byte_end = fc + char_count * 2
+            if byte_end > len(word_stream):
+                byte_end = len(word_stream)
+            chunk = word_stream[byte_start:byte_end].decode("utf-16-le", errors="ignore")
+
+        text_parts.append(chunk)
+
+    raw_text = "".join(text_parts)
+    # Word uses special chars: \r=paragraph, \x07=cell/row end, \x0c=page break
+    raw_text = raw_text.replace("\r", "\n").replace("\x07", "\t").replace("\x0c", "\n")
+    # Clean up control characters but keep CJK and standard chars
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0e-\x1f]", "", raw_text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def read_pdf_text(path: Path) -> str:

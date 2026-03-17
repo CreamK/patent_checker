@@ -18,6 +18,12 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.formparsers import MultiPartParser
+
+MultiPartParser.max_file_size = 1024 * 1024  # 1 MB per chunk (default)
+MultiPartParser.max_files = 50000
+MultiPartParser.max_fields = 50000
+
 from patnet_core import (
     PatentCheckOptions,
     run_patent_check,

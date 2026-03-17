@@ -624,6 +624,43 @@
         stdoutBox: document.getElementById('stdout-box'),
         stderrBox: document.getElementById('stderr-box'),
       }
+      const SKIP_DIRS = new Set([
+        '.git', 'node_modules', '__pycache__', '.next', '.nuxt', 'dist', 'build',
+        '.venv', 'venv', 'env', '.env', 'vendor', '.idea', '.vscode', '.svn',
+        '.hg', '.tox', '.mypy_cache', '.pytest_cache', '.ruff_cache', 'coverage',
+        '.turbo', '.cache', '.parcel-cache', 'out', '.output', 'target',
+        '.gradle', '.DS_Store', 'Pods', 'DerivedData', '.terraform',
+      ])
+      const SKIP_EXTS = new Set([
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp',
+        '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.wav', '.ogg', '.webm',
+        '.zip', '.tar', '.gz', '.bz2', '.rar', '.7z', '.xz', '.zst',
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.a', '.class',
+        '.woff', '.woff2', '.ttf', '.otf', '.eot',
+        '.pyc', '.pyo', '.whl', '.egg', '.jar',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.db', '.sqlite', '.sqlite3', '.mdb',
+        '.iso', '.img', '.dmg', '.deb', '.rpm',
+        '.lock', '.map',
+      ])
+      function filterRepoFiles(fileList) {
+        const files = Array.from(fileList || [])
+        return files.filter(f => {
+          const rel = f.webkitRelativePath || f.name
+          const segments = rel.split('/')
+          for (const seg of segments) {
+            if (SKIP_DIRS.has(seg)) return false
+          }
+          const dot = rel.lastIndexOf('.')
+          if (dot !== -1) {
+            const ext = rel.slice(dot).toLowerCase()
+            if (SKIP_EXTS.has(ext)) return false
+          }
+          if (f.size > 2 * 1024 * 1024) return false
+          return true
+        })
+      }
+
       const ACTIVE_JOB_KEY = 'patent_check_active_job_id'
       const PP_JOB_KEY = 'patent_check_preprocess_job_id'
       let activeJobId = ''
@@ -952,14 +989,18 @@
       }
 
       function refreshRepoSelected() {
-        const files = Array.from(ui.repoPicker.files || [])
-        if (!files.length) {
+        const allFiles = Array.from(ui.repoPicker.files || [])
+        if (!allFiles.length) {
           ui.repoSelected.textContent = '未选择'
           return
         }
-        const first = files[0]
+        const first = allFiles[0]
         const root = first.webkitRelativePath ? first.webkitRelativePath.split('/')[0] : first.name
-        ui.repoSelected.textContent = `目录：${root} | 文件数：${files.length}`
+        const filtered = filterRepoFiles(allFiles)
+        const skipped = allFiles.length - filtered.length
+        let label = `目录：${root} | 代码文件：${filtered.length}`
+        if (skipped > 0) label += ` （已过滤 ${skipped} 个非代码文件）`
+        ui.repoSelected.textContent = label
       }
 
       function refreshPatentSelected() {
@@ -1109,10 +1150,10 @@
           return
         }
 
-        const repoFiles = Array.from(ui.repoPicker.files || [])
+        const repoFiles = filterRepoFiles(ui.repoPicker.files)
         const patentFiles = Array.from(ui.patentPicker.files || [])
         if (!repoFiles.length) {
-          alert('请先选择仓库目录')
+          alert('请先选择仓库目录（或所选目录中没有代码文件）')
           return
         }
 
