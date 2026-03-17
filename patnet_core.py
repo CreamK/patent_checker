@@ -38,6 +38,16 @@ DEFAULT_RECALL_TOP_K = 40
 DEFAULT_RERANK_TOP_N = 15
 DEFAULT_DEEP_MAX_CONCURRENCY = 3
 PREPROCESS_BATCH_SIZE = 3
+IDLE_TIMEOUT = 120
+MAX_NUDGES = 2
+MAX_FULL_RETRIES = 1
+RETRY_DELAY = 10
+NUDGE_MESSAGES = [
+    "You appear to be stuck. Please immediately output your final JSON result now. "
+    "No explanation needed, just the JSON.",
+    "Output the JSON result immediately. Do not use any tools. "
+    "Just respond with the JSON object.",
+]
 
 
 @dataclass
@@ -70,6 +80,7 @@ class PatentCheckOptions:
     preprocess_job_id: str | None = None
     parsed_patents: list[Any] | None = None
     on_stage: Callable | None = None
+    idle_timeout: int = IDLE_TIMEOUT
 
 
 @dataclass
@@ -423,13 +434,193 @@ class SimpleClaudeCodeClient:
         system_prompt: str | None,
         workspace_path: Path,
         timeout: int,
+        idle_timeout: int = IDLE_TIMEOUT,
     ) -> str:
         sdk = self._load_sdk()
+        session_id = str(uuid.uuid4())
+        t_global_start = time.monotonic()
+
+        print(f"[claude] session {session_id[:8]} start | model={self.model or 'default'} "
+              f"| cwd={workspace_path} | timeout={timeout}s idle={idle_timeout}s")
+        print(f"[claude] prompt length: {len(message)} chars")
+
+        all_parts: list[str] = []
+        total_msg_count = 0
+
+        try:
+            async with asyncio.timeout(timeout):
+                for full_attempt in range(1 + MAX_FULL_RETRIES):
+                    sdk_client = self._create_sdk_client(
+                        sdk, system_prompt=system_prompt,
+                        workspace_path=workspace_path,
+                    )
+                    attempt_session_id = session_id if full_attempt == 0 else str(uuid.uuid4())
+                    try:
+                        await sdk_client.connect()
+                        if full_attempt > 0:
+                            print(f"[claude] full retry #{full_attempt} | "
+                                  f"new session {attempt_session_id[:8]}")
+
+                        # Phase 1: send original prompt and receive with idle timeout
+                        print(f"[claude] connected, sending query ...")
+                        await sdk_client.query(message, session_id=attempt_session_id)
+                        parts, msg_count, completed = await self._receive_with_idle_timeout(
+                            sdk_client, idle_timeout, sdk, t_global_start,
+                        )
+                        all_parts.extend(parts)
+                        total_msg_count += msg_count
+
+                        if completed:
+                            output = self._join_parts(all_parts)
+                            if output:
+                                print(f"[claude] final output: {len(output)} chars")
+                                return output
+
+                        # Phase 2: check partial results from what we already have
+                        partial = self._join_parts(all_parts)
+                        if partial:
+                            print(f"[claude] using partial result ({len(partial)} chars)")
+                            return partial
+
+                        # Phase 3: nudge in the same session
+                        for nudge_idx in range(MAX_NUDGES):
+                            nudge_msg = NUDGE_MESSAGES[nudge_idx % len(NUDGE_MESSAGES)]
+                            print(f"[claude] nudge #{nudge_idx + 1}/{MAX_NUDGES} "
+                                  f"in session {attempt_session_id[:8]}")
+                            await sdk_client.query(nudge_msg, session_id=attempt_session_id)
+                            nudge_parts, n_msgs, completed = await self._receive_with_idle_timeout(
+                                sdk_client, idle_timeout, sdk, t_global_start,
+                            )
+                            all_parts.extend(nudge_parts)
+                            total_msg_count += n_msgs
+
+                            output = self._join_parts(all_parts)
+                            if completed or output:
+                                if output:
+                                    print(f"[claude] nudge succeeded, output: {len(output)} chars")
+                                    return output
+
+                        print(f"[claude] all {MAX_NUDGES} nudges exhausted, no usable output")
+
+                    finally:
+                        elapsed = time.monotonic() - t_global_start
+                        print(f"[claude] session {attempt_session_id[:8]} closing | "
+                              f"{elapsed:.1f}s | msgs={total_msg_count} | parts={len(all_parts)}")
+                        await self._safe_disconnect(sdk_client)
+
+                    # Phase 4: prepare for full retry with new session
+                    if full_attempt < MAX_FULL_RETRIES:
+                        print(f"[claude] full retry in {RETRY_DELAY}s ...")
+                        await asyncio.sleep(RETRY_DELAY)
+                        all_parts.clear()
+                        total_msg_count = 0
+
+        except asyncio.TimeoutError:
+            # Global timeout hit — still try to salvage partial results
+            output = self._join_parts(all_parts)
+            if output:
+                print(f"[claude] global timeout but salvaged partial result ({len(output)} chars)")
+                return output
+            raise RuntimeError(
+                f"claude code global timeout ({timeout}s) with no usable output"
+            )
+
+        raise RuntimeError("all attempts exhausted, no output from claude code")
+
+    async def _receive_with_idle_timeout(
+        self,
+        sdk_client: Any,
+        idle_timeout: int,
+        sdk: dict[str, Any],
+        t_global_start: float,
+    ) -> tuple[list[str], int, bool]:
+        """Receive SDK messages with per-message idle timeout.
+        Returns (parts, msg_count, completed).
+        `completed=True` means the response ended normally (ResultMessage received).
+        `completed=False` means idle timeout fired — parts may still contain useful data.
+        """
         AssistantMessage = sdk["AssistantMessage"]
-        ClaudeAgentOptions = sdk["ClaudeAgentOptions"]
-        ClaudeSDKClient = sdk["ClaudeSDKClient"]
         ResultMessage = sdk["ResultMessage"]
         TextBlock = sdk["TextBlock"]
+
+        parts: list[str] = []
+        msg_count = 0
+        response_iter = sdk_client.receive_response().__aiter__()
+
+        while True:
+            try:
+                sdk_message = await asyncio.wait_for(
+                    response_iter.__anext__(), timeout=idle_timeout,
+                )
+            except StopAsyncIteration:
+                return parts, msg_count, True
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - t_global_start
+                print(f"[claude] idle timeout ({idle_timeout}s no new message) "
+                      f"| elapsed={elapsed:.1f}s msgs={msg_count}")
+                return parts, msg_count, False
+
+            msg_count += 1
+            elapsed = time.monotonic() - t_global_start
+            msg_type = type(sdk_message).__name__
+
+            if isinstance(sdk_message, AssistantMessage):
+                text_blocks: list[str] = []
+                tool_blocks: list[str] = []
+                for block in sdk_message.content:
+                    if isinstance(block, TextBlock) and (block.text or "").strip():
+                        parts.append(block.text)
+                        text_blocks.append(block.text)
+                    else:
+                        tool_blocks.append(type(block).__name__)
+                if text_blocks:
+                    preview = text_blocks[0][:120].replace("\n", " ")
+                    print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
+                          f"text={len(text_blocks)} blocks | preview: {preview}")
+                if tool_blocks:
+                    print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
+                          f"tool_use: {', '.join(tool_blocks)}")
+
+            elif isinstance(sdk_message, ResultMessage):
+                result_text = (sdk_message.result or "").strip()
+                if result_text:
+                    parts.append(result_text)
+                preview = result_text[:120].replace("\n", " ") if result_text else "(empty)"
+                print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} ResultMessage | preview: {preview}")
+
+            else:
+                print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} {msg_type}")
+
+    @staticmethod
+    def _join_parts(parts: list[str]) -> str:
+        return "\n".join(p for p in parts if p.strip()).strip()
+
+    async def _safe_disconnect(self, sdk_client: Any) -> None:
+        if not sdk_client:
+            return
+        try:
+            async with asyncio.timeout(5):
+                await sdk_client.disconnect()
+        except Exception:
+            try:
+                transport = getattr(sdk_client, "_transport", None)
+                proc = getattr(transport, "_process", None) if transport else None
+                if proc and hasattr(proc, "kill"):
+                    proc.kill()
+                    print("[claude] force killed stuck subprocess")
+            except Exception:
+                pass
+
+    def _create_sdk_client(
+        self,
+        sdk: dict[str, Any],
+        *,
+        system_prompt: str | None,
+        workspace_path: Path,
+    ) -> Any:
+        """Build and return a new ClaudeSDKClient (not yet connected)."""
+        ClaudeAgentOptions = sdk["ClaudeAgentOptions"]
+        ClaudeSDKClient = sdk["ClaudeSDKClient"]
 
         cli_path = self._resolve_claude_cli_path()
         if not cli_path:
@@ -441,12 +632,6 @@ class SimpleClaudeCodeClient:
         if self.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = self.anthropic_base_url
 
-        # On Windows, .cmd/.bat can't be exec'd by SDK's anyio.open_process
-        # (it uses CreateProcessW which doesn't handle .cmd).
-        # Resolution order:
-        #   1. Find a real .exe (sibling or SDK bundled) → pass as cli_path
-        #   2. No .exe found → don't pass cli_path, let SDK find its own bundled binary
-        #   3. Still fails → use custom transport that wraps with cmd.exe /c
         effective_cli_path: str | None = cli_path
         use_cmd_transport = False
 
@@ -456,15 +641,11 @@ class SimpleClaudeCodeClient:
                 print(f"[claude] Windows: resolved .cmd -> .exe: {resolved_exe}")
                 effective_cli_path = resolved_exe
             else:
-                # Don't pass .cmd path; let SDK try its bundled binary first.
-                # If SDK has no bundled binary, we'll use a custom transport.
                 print(f"[claude] Windows: .cmd found ({cli_path}), "
                       f"will try SDK bundled binary or cmd.exe /c fallback")
                 effective_cli_path = None
                 use_cmd_transport = True
 
-        # bypassPermissions is blocked when running as root/sudo on Linux.
-        # Fall back to acceptEdits which still auto-accepts file operations.
         permission_mode = "bypassPermissions"
         if os.getuid() == 0 if hasattr(os, "getuid") else False:
             permission_mode = "acceptEdits"
@@ -483,73 +664,11 @@ class SimpleClaudeCodeClient:
 
         options = ClaudeAgentOptions(**opts_kwargs)
 
-        # On Windows with .cmd only: create a custom transport that wraps with cmd.exe /c
         custom_transport = None
         if use_cmd_transport and effective_cli_path is None:
             custom_transport = self._make_windows_cmd_transport(options, cli_path)
 
-        parts: list[str] = []
-        sdk_client = ClaudeSDKClient(options=options, transport=custom_transport)
-        session_id = str(uuid.uuid4())
-        msg_count = 0
-        t_start = time.monotonic()
-
-        print(f"[claude] session {session_id[:8]} start | model={self.model or 'default'} | cwd={workspace_path}")
-        print(f"[claude] prompt length: {len(message)} chars | timeout: {timeout}s")
-
-        try:
-            async with asyncio.timeout(timeout):
-                await sdk_client.connect()
-                print(f"[claude] connected, sending query ...")
-                await sdk_client.query(message, session_id=session_id)
-                async for sdk_message in sdk_client.receive_response():
-                    msg_count += 1
-                    elapsed = time.monotonic() - t_start
-                    msg_type = type(sdk_message).__name__
-
-                    if isinstance(sdk_message, AssistantMessage):
-                        text_blocks = []
-                        tool_blocks = []
-                        for block in sdk_message.content:
-                            if isinstance(block, TextBlock) and (block.text or "").strip():
-                                parts.append(block.text)
-                                text_blocks.append(block.text)
-                            else:
-                                block_type = type(block).__name__
-                                tool_blocks.append(block_type)
-
-                        if text_blocks:
-                            preview = text_blocks[0][:120].replace("\n", " ")
-                            print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
-                                  f"text={len(text_blocks)} blocks | preview: {preview}")
-                        if tool_blocks:
-                            print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} AssistantMessage "
-                                  f"tool_use: {', '.join(tool_blocks)}")
-
-                    elif isinstance(sdk_message, ResultMessage):
-                        result_text = (sdk_message.result or "").strip()
-                        if result_text:
-                            parts.append(result_text)
-                        preview = result_text[:120].replace("\n", " ") if result_text else "(empty)"
-                        print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} ResultMessage | preview: {preview}")
-
-                    else:
-                        print(f"[claude] [{elapsed:6.1f}s] msg#{msg_count} {msg_type}")
-
-        finally:
-            elapsed_total = time.monotonic() - t_start
-            try:
-                await sdk_client.disconnect()
-            except Exception:
-                pass
-            print(f"[claude] session {session_id[:8]} done | {elapsed_total:.1f}s | "
-                  f"messages={msg_count} | output_parts={len(parts)}")
-
-        output = "\n".join(part for part in parts if part.strip()).strip()
-        if not output:
-            raise RuntimeError("cloudcode returned empty response")
-        print(f"[claude] final output: {len(output)} chars")
-        return output
+        return ClaudeSDKClient(options=options, transport=custom_transport)
 
     def _load_sdk(self) -> dict[str, Any]:
         try:
@@ -1337,6 +1456,7 @@ async def preprocess_patents(
                 system_prompt="You are a patent document parser. Reply with valid JSON object only.",
                 workspace_path=workspace,
                 timeout=300,
+                idle_timeout=IDLE_TIMEOUT,
             )
             payload = extract_json_payload(raw_response)
             ai_patents = (payload or {}).get("patents", []) if payload else []
@@ -1512,6 +1632,7 @@ async def light_rerank(
     top_n: int,
     workspace_path: Path,
     timeout: int,
+    idle_timeout: int = IDLE_TIMEOUT,
 ) -> list[ParsedPatent]:
     """Layer 2: Light LLM reranking using summaries only."""
     if len(candidates) <= top_n:
@@ -1536,6 +1657,7 @@ async def light_rerank(
             system_prompt="You are a patent relevance screener. Reply with valid JSON object only.",
             workspace_path=workspace_path,
             timeout=timeout,
+            idle_timeout=idle_timeout,
         )
         payload = extract_json_payload(raw)
     except Exception as exc:
@@ -1583,6 +1705,7 @@ async def run_deep_validation(
     workspace_path: Path,
     timeout: int,
     max_concurrency: int = DEFAULT_DEEP_MAX_CONCURRENCY,
+    idle_timeout: int = IDLE_TIMEOUT,
 ) -> list[dict[str, Any]]:
     """Layer 3: Deep validation - one patent per LLM call, concurrent."""
     if not patents or not patterns:
@@ -1602,6 +1725,7 @@ async def run_deep_validation(
                     system_prompt="You are a strict patent pattern validator. Reply with valid JSON object only.",
                     workspace_path=workspace_path,
                     timeout=timeout,
+                    idle_timeout=idle_timeout,
                 )
                 payload = extract_json_payload(raw)
                 matches = (payload or {}).get("matches", []) if payload else []
@@ -1793,6 +1917,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
         system_prompt="You are a strict code patent pattern analyzer. Reply with valid JSON object only.",
         workspace_path=repo_path,
         timeout=options.timeout,
+        idle_timeout=options.idle_timeout,
     )
     scanner_payload = extract_json_payload(scanner_raw)
     if scanner_payload is None:
@@ -1852,6 +1977,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
             top_n=options.rerank_top_n,
             workspace_path=repo_path,
             timeout=options.timeout,
+            idle_timeout=options.idle_timeout,
         )
         funnel["layer2_reranked"] = len(reranked)
         print(f"[info] Layer 2 result: {len(reranked)} patents after rerank")
@@ -1866,6 +1992,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
             workspace_path=repo_path,
             timeout=options.timeout,
             max_concurrency=options.deep_max_concurrency,
+            idle_timeout=options.idle_timeout,
         )
         funnel["layer3_deep_compared"] = len(reranked)
         matches = normalize_matches(raw_matches, max_matches=options.max_matches)
@@ -1887,6 +2014,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
                 system_prompt="You are a strict patent pattern validator. Reply with valid JSON object only.",
                 workspace_path=repo_path,
                 timeout=options.timeout,
+                idle_timeout=options.idle_timeout,
             )
             validator_payload = extract_json_payload(validator_raw)
             if validator_payload is None:
@@ -1899,6 +2027,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
                 workspace_path=repo_path,
                 timeout=options.timeout,
                 max_concurrency=options.deep_max_concurrency,
+                idle_timeout=options.idle_timeout,
             )
             matches = normalize_matches(raw_matches, max_matches=options.max_matches)
 

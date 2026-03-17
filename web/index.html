@@ -928,6 +928,19 @@
         }
       }
 
+      function clearPpState() {
+        stopPpPolling()
+        ppJobId = ''
+        localStorage.removeItem(PP_JOB_KEY)
+        ui.ppProgress.classList.remove('active')
+        ui.ppPreview.classList.remove('active')
+        ui.ppPreview.innerHTML = ''
+        ui.ppBar.style.width = '0%'
+        ui.ppText.textContent = ''
+        ui.preprocessBtn.disabled = !Array.from(ui.patentPicker.files || []).length
+        setPpBusy(false)
+      }
+
       async function pollJobStatus(jobId) {
         const token = String(jobId || '').trim()
         if (!token) return
@@ -938,6 +951,14 @@
         const tick = async () => {
           try {
             const resp = await fetch(`/api/run-upload/${encodeURIComponent(token)}`)
+            if (resp.status === 404) {
+              clearActiveJob()
+              stopPolling()
+              setRunBusy(false)
+              setStatus('空闲', 'idle')
+              ui.detailText.textContent = '未找到进行中的任务，请重新发起扫描。'
+              return
+            }
             const data = await resp.json()
             if (!resp.ok) {
               throw new Error(data.detail || '状态查询失败')
@@ -1007,7 +1028,15 @@
         const files = Array.from(ui.patentPicker.files || [])
         if (!files.length) {
           ui.patentSelected.textContent = '未选择'
+          ppJobId = ''
+          localStorage.removeItem(PP_JOB_KEY)
+          stopPpPolling()
           ui.preprocessBtn.disabled = true
+          ui.ppProgress.classList.remove('active')
+          ui.ppPreview.classList.remove('active')
+          ui.ppPreview.innerHTML = ''
+          ui.ppBar.style.width = '0%'
+          ui.ppText.textContent = '准备中...'
           return
         }
         ui.patentSelected.textContent = `文件数：${files.length}`
@@ -1059,8 +1088,18 @@
         const tick = async () => {
           try {
             const resp = await fetch(`/api/preprocess/${encodeURIComponent(token)}`)
-            const data = await resp.json()
-            if (!resp.ok) throw new Error(data.detail || '查询失败')
+            if (resp.status === 404) {
+              clearPpState()
+              if (!activeJobId) setStatus('空闲', 'idle')
+              return
+            }
+            let data = {}
+            try {
+              data = await resp.json()
+            } catch {
+              data = {}
+            }
+            if (!resp.ok) throw new Error(data.detail || `查询失败 (${resp.status})`)
 
             const status = String(data.status || '').toLowerCase()
             const done = Number(data.progress_done || 0)
@@ -1095,7 +1134,13 @@
             }
             throw new Error(`未知状态: ${status}`)
           } catch (err) {
-            ui.ppText.textContent = `预处理查询失败: ${err}`
+            const message = String(err)
+            if (message.includes('job not found') || message.includes('expired') || message.includes('404')) {
+              clearPpState()
+              if (!activeJobId) setStatus('空闲', 'idle')
+              return
+            }
+            ui.ppText.textContent = `预处理查询失败: ${message}`
             ppPollTimerId = setTimeout(tick, 3000)
           }
         }
@@ -1253,8 +1298,32 @@
       async function resumePreprocessIfNeeded() {
         const savedPpId = String(localStorage.getItem(PP_JOB_KEY) || '').trim()
         if (!savedPpId) return
-        ppJobId = savedPpId
-        await pollPreprocessStatus(savedPpId)
+        try {
+          const resp = await fetch(`/api/preprocess/${encodeURIComponent(savedPpId)}`)
+          if (!resp.ok) {
+            localStorage.removeItem(PP_JOB_KEY)
+            return
+          }
+          const data = await resp.json()
+          const st = String(data.status || '').toLowerCase()
+          if (st === 'completed') {
+            ppJobId = savedPpId
+            ui.ppProgress.classList.add('active')
+            ui.ppBar.style.width = '100%'
+            ui.ppText.textContent = `预处理完成: ${(data.patents || []).length} 个专利`
+            setStatus('预处理完成', 'ok')
+            renderPpPreview(data.patents || [])
+            return
+          }
+          if (st === 'failed') {
+            localStorage.removeItem(PP_JOB_KEY)
+            return
+          }
+          ppJobId = savedPpId
+          await pollPreprocessStatus(savedPpId)
+        } catch (e) {
+          localStorage.removeItem(PP_JOB_KEY)
+        }
       }
 
       resumePreprocessIfNeeded()
