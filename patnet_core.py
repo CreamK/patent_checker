@@ -463,8 +463,15 @@ class SimpleClaudeCodeClient:
                 effective_cli_path = None
                 use_cmd_transport = True
 
+        # bypassPermissions is blocked when running as root/sudo on Linux.
+        # Fall back to acceptEdits which still auto-accepts file operations.
+        permission_mode = "bypassPermissions"
+        if os.getuid() == 0 if hasattr(os, "getuid") else False:
+            permission_mode = "acceptEdits"
+            print("[claude] running as root, using acceptEdits permission mode")
+
         opts_kwargs: dict[str, Any] = {
-            "permission_mode": "bypassPermissions",
+            "permission_mode": permission_mode,
             "cwd": str(workspace_path.resolve()),
             "model": self.model,
             "system_prompt": system_prompt,
