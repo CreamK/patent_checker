@@ -10,6 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
     <style>
       :root {
         --bg-0: #f4f7f2;
@@ -461,6 +462,12 @@
             <div class="select-box">
               <input id="repo-picker" type="file" webkitdirectory directory multiple />
               <div id="repo-selected" class="selected">未选择</div>
+              <div id="repo-upload-progress" class="progress-wrap">
+                <div class="progress-bar-outer">
+                  <div id="repo-upload-bar" class="progress-bar-inner"></div>
+                </div>
+                <div id="repo-upload-text" class="progress-text">准备中…</div>
+              </div>
             </div>
 
             <div class="inline-grid">
@@ -667,6 +674,10 @@
       let ppJobId = ''
       let ppPollTimerId = null
       let pollTimerId = null
+      let repoUploadId = ''
+      let repoUploadXhr = null
+      let repoUploadStatus = ''
+      let repoUploadGen = 0
 
       function setRunBusy(isBusy) {
         ui.runBtn.disabled = isBusy
@@ -1010,9 +1021,22 @@
       }
 
       function refreshRepoSelected() {
+        repoUploadGen++
+        if (repoUploadXhr) {
+          repoUploadXhr.abort()
+          repoUploadXhr = null
+        }
+        repoUploadId = ''
+        repoUploadStatus = ''
+
+        const progressWrap = document.getElementById('repo-upload-progress')
+        const barEl = document.getElementById('repo-upload-bar')
+        const textEl = document.getElementById('repo-upload-text')
+
         const allFiles = Array.from(ui.repoPicker.files || [])
         if (!allFiles.length) {
           ui.repoSelected.textContent = '未选择'
+          if (progressWrap) progressWrap.classList.remove('active')
           return
         }
         const first = allFiles[0]
@@ -1022,6 +1046,110 @@
         let label = `目录：${root} | 代码文件：${filtered.length}`
         if (skipped > 0) label += ` （已过滤 ${skipped} 个非代码文件）`
         ui.repoSelected.textContent = label
+
+        const gen = repoUploadGen
+        startRepoZipUpload(gen, filtered, root, progressWrap, barEl, textEl)
+      }
+
+      async function startRepoZipUpload(gen, repoFiles, rootName, progressWrap, barEl, textEl) {
+        if (!repoFiles.length) return
+
+        if (progressWrap) {
+          progressWrap.classList.add('active')
+          barEl.style.width = '0%'
+          textEl.textContent = `正在打包 ${repoFiles.length} 个文件为 zip…`
+        }
+        repoUploadStatus = 'zipping'
+
+        await new Promise((r) => setTimeout(r, 30))
+        if (gen !== repoUploadGen) return
+
+        try {
+          const zip = new JSZip()
+          const total = repoFiles.length
+          for (let i = 0; i < total; i++) {
+            const file = repoFiles[i]
+            const relPath = file.webkitRelativePath || file.name
+            zip.file(relPath, file)
+            if (i > 0 && i % 2000 === 0) {
+              const zipPct = Math.round((i / total) * 40)
+              if (barEl) barEl.style.width = `${zipPct}%`
+              if (textEl) textEl.textContent = `正在打包（${i}/${total}）…`
+              await new Promise((r) => setTimeout(r, 0))
+              if (gen !== repoUploadGen) return
+            }
+          }
+
+          if (gen !== repoUploadGen) return
+          if (barEl) barEl.style.width = '40%'
+          if (textEl) textEl.textContent = '正在生成压缩文件…'
+          repoUploadStatus = 'compressing'
+
+          const zipBlob = await zip.generateAsync(
+            { type: 'blob', compression: 'STORE' },
+            (meta) => {
+              if (gen !== repoUploadGen) return
+              const pct = Math.round(40 + (meta.percent / 100) * 20)
+              if (barEl) barEl.style.width = `${pct}%`
+              if (textEl) textEl.textContent = `正在生成压缩文件（${Math.round(meta.percent)}%）…`
+            },
+          )
+
+          if (gen !== repoUploadGen) return
+          const sizeMB = (zipBlob.size / 1024 / 1024).toFixed(1)
+          if (barEl) barEl.style.width = '60%'
+          if (textEl) textEl.textContent = `压缩完成（${sizeMB} MB），正在上传…`
+          repoUploadStatus = 'uploading'
+
+          const form = new FormData()
+          form.append('repo_zip', zipBlob, `${rootName}.zip`)
+
+          const data = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            repoUploadXhr = xhr
+            xhr.open('POST', '/api/upload-repo')
+            const uploadStart = Date.now()
+            xhr.upload.addEventListener('progress', (ev) => {
+              if (gen !== repoUploadGen) return
+              if (ev.lengthComputable && ev.total > 0) {
+                const rawPct = ev.loaded / ev.total
+                const pct = Math.round(60 + rawPct * 30)
+                const elapsedSec = ((Date.now() - uploadStart) / 1000).toFixed(0)
+                if (barEl) barEl.style.width = `${pct}%`
+                if (textEl) textEl.textContent = `正在上传（${Math.round(rawPct * 100)}%，${elapsedSec}s，${sizeMB} MB）…`
+              }
+            })
+            xhr.upload.addEventListener('load', () => {
+              if (gen !== repoUploadGen) return
+              if (barEl) barEl.style.width = '90%'
+              if (textEl) textEl.textContent = '上传完成，服务端解压中…'
+              repoUploadStatus = 'extracting'
+            })
+            xhr.addEventListener('load', () => {
+              repoUploadXhr = null
+              try {
+                const json = JSON.parse(xhr.responseText)
+                if (xhr.status >= 200 && xhr.status < 300) resolve(json)
+                else reject(new Error(json.detail || `HTTP ${xhr.status}`))
+              } catch { reject(new Error(`解析失败 (HTTP ${xhr.status})`)) }
+            })
+            xhr.addEventListener('error', () => { repoUploadXhr = null; reject(new Error('网络错误，请检查服务端是否运行')) })
+            xhr.addEventListener('abort', () => { repoUploadXhr = null; reject(new Error('_aborted_')) })
+            xhr.send(form)
+          })
+
+          if (gen !== repoUploadGen) return
+          repoUploadId = data.upload_id || ''
+          repoUploadStatus = 'done'
+          if (barEl) barEl.style.width = '100%'
+          if (textEl) textEl.textContent = `仓库已就绪（${data.file_count} 个文件），可直接开始扫描`
+        } catch (err) {
+          if (gen !== repoUploadGen) return
+          repoUploadId = ''
+          repoUploadStatus = 'error'
+          if (barEl) barEl.style.width = '0%'
+          if (textEl) textEl.textContent = `仓库上传失败：${err.message}`
+        }
       }
 
       function refreshPatentSelected() {
@@ -1208,31 +1336,25 @@
           return
         }
 
-        const form = new FormData()
-        for (const file of repoFiles) {
-          const filename = file.webkitRelativePath || file.name
-          form.append('repo_files', file, filename)
-        }
-        for (const file of patentFiles) {
-          form.append('patent_files', file, file.name)
+        if (['zipping', 'compressing', 'uploading', 'extracting'].includes(repoUploadStatus)) {
+          alert('仓库文件正在打包/上传中，请等待完成后再开始扫描。')
+          return
         }
 
-        form.append('timeout', String(Number(ui.timeout.value) || 600))
-        form.append('model', ui.model.value.trim())
-        form.append('max_patterns', String(Number(ui.maxPatterns.value) || 30))
-        form.append('max_matches', String(Number(ui.maxMatches.value) || 50))
-        if (hasPreprocess) {
-          form.append('preprocess_job_id', ppJobId)
+        if (repoUploadStatus !== 'done' || !repoUploadId) {
+          alert('仓库尚未上传完成，请等待进度条显示「已就绪」后再开始扫描。\n\n如果上传失败，请重新选择仓库目录。')
+          return
         }
 
-        setRunBusy(true)
-        setStatus('扫描中', 'run')
-        ui.detailText.textContent = '正在上传并创建扫描任务，请稍候...'
-        ui.stdoutBox.textContent = '-'
-        ui.stderrBox.textContent = '-'
         const repoRoot = repoFiles[0]?.webkitRelativePath
           ? repoFiles[0].webkitRelativePath.split('/')[0]
           : 'uploaded-repo'
+
+        setRunBusy(true)
+        setStatus('扫描中', 'run')
+        ui.detailText.textContent = '仓库已就绪，正在提交扫描任务…'
+        ui.stdoutBox.textContent = '-'
+        ui.stderrBox.textContent = '-'
         renderUsedInputs(
           {
             repo_label: repoRoot,
@@ -1243,29 +1365,34 @@
           patentFiles.map((f) => f.name),
         )
 
+        const form = new FormData()
+        form.append('repo_upload_id', repoUploadId)
+        for (const file of patentFiles) {
+          form.append('patent_files', file, file.name)
+        }
+        form.append('timeout', String(Number(ui.timeout.value) || 600))
+        form.append('model', ui.model.value.trim())
+        form.append('max_patterns', String(Number(ui.maxPatterns.value) || 30))
+        form.append('max_matches', String(Number(ui.maxMatches.value) || 50))
+        if (hasPreprocess) {
+          form.append('preprocess_job_id', ppJobId)
+        }
+
         try {
-          const resp = await fetch('/api/run-upload', {
-            method: 'POST',
-            body: form,
-          })
+          const resp = await fetch('/api/run-upload', { method: 'POST', body: form })
           const data = await resp.json()
-          if (!resp.ok) {
-            throw new Error(data.detail || 'request failed')
-          }
+          if (!resp.ok) throw new Error(data.detail || 'request failed')
+          repoUploadId = ''
+          repoUploadStatus = ''
           const jobId = String(data.job_id || '').trim()
-          if (!jobId) {
-            throw new Error('服务端未返回任务ID')
-          }
+          if (!jobId) throw new Error('服务端未返回任务ID')
+          ui.detailText.textContent = '扫描任务已创建，等待执行…'
           renderRunningJob(data)
           await pollJobStatus(jobId)
         } catch (err) {
           setStatus('请求失败', 'err')
           ui.detailText.textContent = String(err)
-          renderUsedInputs(
-            null,
-            repoFiles[0]?.webkitRelativePath ? repoFiles[0].webkitRelativePath.split('/')[0] : 'uploaded-repo',
-            patentFiles.map((f) => f.name),
-          )
+          renderUsedInputs(null, repoRoot, patentFiles.map((f) => f.name))
           renderPatentGroups([], new Map())
           clearActiveJob()
           stopPolling()

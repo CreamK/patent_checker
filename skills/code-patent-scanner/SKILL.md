@@ -72,7 +72,7 @@ Activate this skill when the user asks to:
 - This is TECHNICAL analysis, not legal advice
 - Output identifies "distinctive patterns" not "patentable inventions"
 - Always recommend professional consultation for IP decisions
-- Large repos (>100 source files) use Quick Mode by default
+- Large repos may require more analysis time as the scanner explores autonomously
 
 ---
 
@@ -160,7 +160,7 @@ Structure each pattern as:
 
 #### 3.7 Claim Angle Generation (JB-5)
 
-For high-scoring patterns (≥8), generate three claim framings:
+For each pattern, generate three claim framings:
 
 1. **Method claim**: "A method for [verb]ing, comprising the steps of..."
 2. **System claim**: "A system comprising: [component] configured to..."
@@ -212,7 +212,7 @@ For each identified pattern, score on four dimensions:
 - 2: Challenges core approach
 - 3: Redefines the problem entirely
 
-**Minimum Threshold**: Only report patterns with total score >= 8
+**Reporting**: Report ALL patterns found, regardless of score. The caller will rank and filter.
 
 ### Patent Value Signals (JB-3)
 
@@ -235,40 +235,18 @@ primary filter; JB-3 provides additional context for prioritization.
 
 ---
 
-## Large Repository Strategy
+## Repository Analysis Strategy
 
-For repositories with >100 source files, offer two modes:
+Autonomously explore the repository structure and decide which files to analyze.
+There is no fixed limit on the number of files to read — use your judgment based on
+the repository's structure, size, and complexity.
 
-### Mode Selection (>100 files)
+### Recommended approach:
 
-```
-I found [N] source files. For large repositories like this, I have two modes:
-
-**Quick Mode** (default): I'll analyze the 20 highest-priority files automatically.
-  -> Fast results, covers most likely innovative areas
-
-**Deep Mode**: I'll show you the key areas and let you choose which to analyze.
-  -> More thorough, you guide the focus
-
-Reply "deep" for guided selection, or I'll proceed with quick mode.
-```
-
-### Quick Mode (DEFAULT)
-
-1. List all source files with paths and line counts
-2. Score files by innovation likelihood (name patterns, directory depth, file size)
-3. Select and analyze top 20 highest-priority files
-4. Present findings, offer: "Want me to analyze additional areas?"
-
-### Deep Mode (ON REQUEST)
-
-Trigger: User says "deep", "guided", "thorough", or explicitly requests area selection.
-
-1. Categorize files by directory/module
-2. Identify high-priority candidates (max 5 areas)
-3. Present areas to user and wait for selection
-4. Analyze selected area, report findings
-5. Ask if user wants to continue with another area
+1. **Survey**: List directories and understand the project structure
+2. **Prioritize**: Identify the most architecturally significant areas (core logic, engines, algorithms, custom data structures)
+3. **Analyze in depth**: Read and analyze files you judge to be important — read as many as needed to form a thorough understanding
+4. **Report all patterns found**: Report every distinctive pattern regardless of score — the caller will handle filtering
 
 ---
 
@@ -310,7 +288,7 @@ Trigger: User says "deep", "guided", "thorough", or explicitly requests area sel
         "competitive_value": "low|medium|high",
         "novelty_confidence": "low|medium|high"
       },
-      "_claim_angles_note": "Always present: only patterns >=8 are reported, claim_angles generated for all >=8",
+      "_claim_angles_note": "Always present for all reported patterns",
       "claim_angles": [
         "Method for [verb]ing comprising...",
         "System comprising [component] configured to...",
@@ -370,7 +348,7 @@ Every scan output MUST end with:
 ```markdown
 ## Next Steps
 
-1. **Review** - Prioritize patterns scoring >=8
+1. **Review** - Prioritize highest-scoring patterns
 2. **Validate** - Run `code-patent-validator` for search strategies
 3. **Document** - Save commits, benchmarks, design docs
 4. **Consult** - For high-value patterns, consult patent attorney

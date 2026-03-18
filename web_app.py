@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,44 @@ app = FastAPI(title="Patent Check Web", version="0.1.0")
 JOB_TTL_SECONDS = 60 * 60
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = asyncio.Lock()
+
+REPO_UPLOAD_TTL_SECONDS = 30 * 60
+REPO_UPLOADS: dict[str, dict[str, Any]] = {}
+REPO_UPLOADS_LOCK = asyncio.Lock()
+
+
+async def _store_repo_upload(info: dict[str, Any]) -> None:
+    async with REPO_UPLOADS_LOCK:
+        REPO_UPLOADS[str(info["upload_id"])] = info
+
+
+async def _get_repo_upload(upload_id: str) -> dict[str, Any] | None:
+    async with REPO_UPLOADS_LOCK:
+        info = REPO_UPLOADS.get(upload_id)
+        return dict(info) if info else None
+
+
+async def _consume_repo_upload(upload_id: str) -> dict[str, Any] | None:
+    """Get and remove a repo upload (one-time use)."""
+    async with REPO_UPLOADS_LOCK:
+        info = REPO_UPLOADS.pop(upload_id, None)
+        return dict(info) if info else None
+
+
+async def _cleanup_repo_uploads() -> None:
+    now = time.time()
+    stale: list[str] = []
+    async with REPO_UPLOADS_LOCK:
+        for uid, info in REPO_UPLOADS.items():
+            if now - info.get("created_ts", 0) > REPO_UPLOAD_TTL_SECONDS:
+                stale.append(uid)
+        for uid in stale:
+            removed = REPO_UPLOADS.pop(uid, None)
+            if removed:
+                try:
+                    shutil.rmtree(removed["temp_root"])
+                except Exception:
+                    pass
 
 
 class RunRequest(BaseModel):
@@ -313,55 +352,132 @@ async def run_scan(payload: RunRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/api/upload-repo")
+async def upload_repo(
+    repo_zip: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Accept a zip of the repo, extract it, and store for later scan."""
+    await _cleanup_repo_uploads()
+
+    temp_root = Path(tempfile.mkdtemp(prefix="patent_repo_pre_")).resolve()
+    repo_dir = temp_root / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_path = temp_root / "repo.zip"
+
+    try:
+        print("[Patent Check] 接收仓库 zip 文件…", flush=True)
+        with zip_path.open("wb") as fh:
+            shutil.copyfileobj(repo_zip.file, fh)
+        zip_size_mb = zip_path.stat().st_size / 1024 / 1024
+        print(f"[Patent Check] zip 已保存（{zip_size_mb:.1f} MB），开始解压…", flush=True)
+
+        extracted = 0
+        repo_root_label = "uploaded-repo"
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = [m for m in zf.namelist() if not m.endswith("/")]
+            total = len(members)
+            for name in members:
+                parts = Path(name).parts
+                if not parts:
+                    continue
+                if any(p == ".." for p in parts):
+                    continue
+                if len(parts) > 1 and repo_root_label == "uploaded-repo":
+                    repo_root_label = parts[0]
+                inner_parts = parts[1:] if len(parts) > 1 else parts
+                if not inner_parts:
+                    continue
+                target = repo_dir.joinpath(*inner_parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+                if total > 2000 and extracted % 5000 == 0:
+                    print(f"[Patent Check] 已解压 {extracted}/{total}", flush=True)
+
+        zip_path.unlink(missing_ok=True)
+
+        if extracted == 0:
+            raise HTTPException(status_code=400, detail="zip 中没有可用文件")
+
+        upload_id = uuid.uuid4().hex
+        print(f"[Patent Check] 仓库解压完成：{extracted} 个文件，upload_id={upload_id}", flush=True)
+        await _store_repo_upload({
+            "upload_id": upload_id,
+            "temp_root": str(temp_root),
+            "repo_dir": str(repo_dir),
+            "repo_root_label": repo_root_label,
+            "file_count": extracted,
+            "created_ts": time.time(),
+        })
+        return {
+            "upload_id": upload_id,
+            "file_count": extracted,
+            "repo_label": repo_root_label,
+        }
+    except HTTPException:
+        try:
+            shutil.rmtree(temp_root)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            shutil.rmtree(temp_root)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"repo zip upload failed: {exc}") from exc
+
+
 @app.post("/api/run-upload")
 async def run_scan_upload(
-    repo_files: list[UploadFile] = File(default_factory=list),
     patent_files: list[UploadFile] = File(default_factory=list),
     timeout: int = Form(default=600),
     max_patterns: int = Form(default=30),
     max_matches: int = Form(default=50),
     model: str = Form(default=""),
     preprocess_job_id: str = Form(default=""),
+    repo_upload_id: str = Form(default=""),
+    repo_path: str = Form(default=""),
 ) -> dict[str, Any]:
-    if not repo_files:
-        raise HTTPException(status_code=400, detail="repo_files is empty")
-
     pp_job_id = preprocess_job_id.strip()
     has_preprocess = bool(pp_job_id)
+    ru_id = repo_upload_id.strip()
+    local_repo_path = repo_path.strip()
+
+    if not ru_id and not local_repo_path:
+        raise HTTPException(status_code=400, detail="需要 repo_upload_id 或 repo_path")
     if not patent_files and not has_preprocess:
         raise HTTPException(status_code=400, detail="patent_files is empty and no preprocess_job_id")
 
-    temp_root = Path(tempfile.mkdtemp(prefix="patent_web_upload_")).resolve()
-    repo_dir = temp_root / "repo"
-    patents_dir = temp_root / "patents"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    patents_dir.mkdir(parents=True, exist_ok=True)
+    if local_repo_path:
+        resolved = Path(local_repo_path).expanduser().resolve()
+        if not resolved.exists() or not resolved.is_dir():
+            raise HTTPException(status_code=400, detail=f"本地路径不存在或不是目录: {resolved}")
+        repo_dir = resolved
+        repo_root_label = resolved.name
+        saved_repo_files = sum(1 for _ in resolved.rglob("*") if _.is_file())
+        temp_root = Path(tempfile.mkdtemp(prefix="patent_web_local_")).resolve()
+        patents_dir = temp_root / "patents"
+        patents_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Patent Check] 使用本地路径: {resolved} ({saved_repo_files} 个文件)", flush=True)
+    else:
+        pre_upload = await _consume_repo_upload(ru_id)
+        if not pre_upload:
+            raise HTTPException(status_code=400, detail=f"repo_upload_id 未找到或已过期: {ru_id}")
+        temp_root = Path(pre_upload["temp_root"]).resolve()
+        repo_dir = Path(pre_upload["repo_dir"]).resolve()
+        saved_repo_files = int(pre_upload["file_count"])
+        repo_root_label = str(pre_upload.get("repo_root_label", "uploaded-repo"))
+        patents_dir = temp_root / "patents"
+        patents_dir.mkdir(parents=True, exist_ok=True)
 
     output_json_path = temp_root / "result.json"
-
-    saved_repo_files = 0
     saved_patent_paths: list[Path] = []
-    repo_root_label = "uploaded-repo"
     patent_upload_meta: list[dict[str, str]] = []
 
     try:
-        for item in repo_files:
-            rel = _safe_relative_path(item.filename or "")
-            # Drop first segment for webkitdirectory root folder if present.
-            if len(rel.parts) > 1:
-                repo_root_label = rel.parts[0]
-            elif len(rel.parts) == 1 and repo_root_label == "uploaded-repo":
-                repo_root_label = rel.parts[0]
-            parts = rel.parts[1:] if len(rel.parts) > 1 else rel.parts
-            if not parts:
-                continue
-            target = repo_dir.joinpath(*parts)
-            _save_upload_file(item, target)
-            saved_repo_files += 1
-
-        if saved_repo_files == 0:
-            raise HTTPException(status_code=400, detail="no usable repo files uploaded")
-
         for idx, item in enumerate(patent_files, start=1):
             rel = _safe_relative_path(item.filename or f"patent-{idx}")
             target = patents_dir / rel.name
@@ -374,7 +490,6 @@ async def run_scan_upload(
                 }
             )
 
-        # Resolve patents: from preprocess job or from uploaded files
         parsed_patents_for_options: list[ParsedPatent] | None = None
 
         if has_preprocess:

@@ -38,15 +38,16 @@ DEFAULT_RECALL_TOP_K = 40
 DEFAULT_RERANK_TOP_N = 15
 DEFAULT_DEEP_MAX_CONCURRENCY = 3
 PREPROCESS_BATCH_SIZE = 3
-IDLE_TIMEOUT = 120
+IDLE_TIMEOUT = 300
 MAX_NUDGES = 2
 MAX_FULL_RETRIES = 1
 RETRY_DELAY = 10
 NUDGE_MESSAGES = [
-    "You appear to be stuck. Please immediately output your final JSON result now. "
-    "No explanation needed, just the JSON.",
-    "Output the JSON result immediately. Do not use any tools. "
-    "Just respond with the JSON object.",
+    "You appear to be stuck or still processing. Stop all tool usage now and immediately "
+    "output your final JSON result based on what you have analyzed so far. "
+    "Output ONLY the JSON object, no markdown, no explanation.",
+    "STOP. Output the JSON result NOW with whatever patterns you have found so far. "
+    "Do not use any more tools. Respond with ONLY the raw JSON object.",
 ]
 
 
@@ -180,13 +181,13 @@ class PatentSkillAdapter:
     SCANNER_FALLBACK = """# Code Patent Scanner (Fallback)
 Role: discover distinctive technical patterns from code.
 Rules:
-1. Analyze repository source files and identify high-value technical patterns.
+1. Autonomously explore the repository and analyze important source files.
 2. Score each pattern by 4 dimensions:
    - distinctiveness (0-4)
    - sophistication (0-3)
    - system_impact (0-3)
    - frame_shift (0-3)
-3. Only report patterns with total score >= 8.
+3. Report ALL patterns found regardless of score. The caller will rank and filter.
 4. For each pattern provide: title, category, source_files, why_distinctive,
    claim_angles (method/system/apparatus), abstract_mechanism, concrete_reference.
 5. Output must be strict JSON object.
@@ -476,13 +477,7 @@ class SimpleClaudeCodeClient:
                                 print(f"[claude] final output: {len(output)} chars")
                                 return output
 
-                        # Phase 2: check partial results from what we already have
-                        partial = self._join_parts(all_parts)
-                        if partial:
-                            print(f"[claude] using partial result ({len(partial)} chars)")
-                            return partial
-
-                        # Phase 3: nudge in the same session
+                        # Phase 2: nudge in the same session to get Claude to continue
                         for nudge_idx in range(MAX_NUDGES):
                             nudge_msg = NUDGE_MESSAGES[nudge_idx % len(NUDGE_MESSAGES)]
                             print(f"[claude] nudge #{nudge_idx + 1}/{MAX_NUDGES} "
@@ -499,6 +494,12 @@ class SimpleClaudeCodeClient:
                                 if output:
                                     print(f"[claude] nudge succeeded, output: {len(output)} chars")
                                     return output
+
+                        # Phase 3: fall back to partial results from what we already have
+                        partial = self._join_parts(all_parts)
+                        if partial:
+                            print(f"[claude] using partial result after nudges ({len(partial)} chars)")
+                            return partial
 
                         print(f"[claude] all {MAX_NUDGES} nudges exhausted, no usable output")
 
@@ -1062,6 +1063,50 @@ def to_float(value: Any, default: float) -> float:
         return default
 
 
+def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
+    """Best-effort repair of truncated JSON by closing open brackets/braces."""
+    opens = 0
+    open_sq = 0
+    in_string = False
+    escaped = False
+    for ch in fragment:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            opens += 1
+        elif ch == "}":
+            opens -= 1
+        elif ch == "[":
+            open_sq += 1
+        elif ch == "]":
+            open_sq -= 1
+
+    if opens <= 0 and open_sq <= 0:
+        return None
+
+    if in_string:
+        fragment += '"'
+    fragment += "]" * max(open_sq, 0)
+    fragment += "}" * max(opens, 0)
+    try:
+        parsed = json.loads(fragment)
+        if isinstance(parsed, dict):
+            print("[info] repaired truncated JSON successfully")
+            return parsed
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def extract_json_payload(text: str | None) -> dict[str, Any] | None:
     raw = (text or "").strip()
     if not raw:
@@ -1091,6 +1136,14 @@ def extract_json_payload(text: str | None) -> dict[str, Any] | None:
             continue
         if isinstance(parsed, dict):
             return parsed
+
+    first_brace = raw.find("{")
+    if first_brace >= 0:
+        fragment = raw[first_brace:]
+        repaired = _try_repair_truncated_json(fragment)
+        if repaired is not None:
+            return repaired
+
     return None
 
 
@@ -1098,7 +1151,7 @@ def normalize_patterns(raw_patterns: Any, *, max_patterns: int = MAX_PATTERNS) -
     if not isinstance(raw_patterns, list):
         return []
 
-    patterns: list[dict[str, Any]] = []
+    all_parsed: list[dict[str, Any]] = []
     for index, item in enumerate(raw_patterns, start=1):
         if not isinstance(item, dict):
             continue
@@ -1130,12 +1183,10 @@ def normalize_patterns(raw_patterns: Any, *, max_patterns: int = MAX_PATTERNS) -
             "abstract_mechanism": str(item.get("abstract_mechanism") or "").strip(),
             "concrete_reference": str(item.get("concrete_reference") or "").strip(),
         }
+        all_parsed.append(pattern)
 
-        if total >= 8:
-            patterns.append(pattern)
-
-    patterns.sort(key=lambda x: x.get("score_total", 0), reverse=True)
-    return patterns[:max_patterns]
+    all_parsed.sort(key=lambda x: x.get("score_total", 0), reverse=True)
+    return all_parsed[:max_patterns]
 
 
 def normalize_matches(raw_matches: Any, *, max_matches: int = MAX_MATCHES) -> list[dict[str, Any]]:
@@ -1921,18 +1972,49 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
     )
     scanner_payload = extract_json_payload(scanner_raw)
     if scanner_payload is None:
-        print("[error] scanner output is not valid JSON object", file=sys.stderr)
-        return 6
+        preview = (scanner_raw or "")[:500].replace("\n", " ")
+        print(f"[warn] scanner output is not valid JSON object", file=sys.stderr)
+        print(f"[warn] raw output preview ({len(scanner_raw or '')} chars): {preview}", file=sys.stderr)
+        print("[info] retrying scanner with explicit JSON-only instruction ...", flush=True)
+        await _emit_stage("scanner_retry", "Scanner 输出非 JSON，重试中...")
+        retry_prompt = (
+            "Your previous analysis is complete but the output was not valid JSON. "
+            "Based on ALL the files you already analyzed, output the final result as a "
+            "single raw JSON object NOW. No markdown fences, no explanation, just the JSON.\n\n"
+            "Required JSON shape:\n"
+            '{"scan_metadata": {"repository": "...", "files_analyzed": 0, "files_skipped": 0}, '
+            '"patterns": [{"pattern_id": "pattern-1", "title": "...", "category": "...", '
+            '"description": "...", "source_files": ["..."], '
+            '"score": {"distinctiveness": 0, "sophistication": 0, "system_impact": 0, '
+            '"frame_shift": 0, "total": 0}, '
+            '"why_distinctive": "...", "claim_angles": ["..."], '
+            '"abstract_mechanism": "...", "concrete_reference": "..."}], '
+            '"summary": {"total_patterns": 0}}'
+        )
+        retry_raw = await cloud_client.analyze(
+            message=retry_prompt,
+            system_prompt="Output ONLY a valid JSON object. No tools, no markdown, no text.",
+            workspace_path=repo_path,
+            timeout=min(options.timeout, 120),
+            idle_timeout=60,
+        )
+        scanner_payload = extract_json_payload(retry_raw)
+        if scanner_payload is None:
+            retry_preview = (retry_raw or "")[:500].replace("\n", " ")
+            print(f"[error] retry also not valid JSON", file=sys.stderr)
+            print(f"[error] retry preview ({len(retry_raw or '')} chars): {retry_preview}", file=sys.stderr)
+            return 6
+        print("[info] retry succeeded, got valid JSON")
 
     patterns = normalize_patterns(scanner_payload.get("patterns"), max_patterns=options.max_patterns)
-    print(f"[info] patterns extracted (score>=8): {len(patterns)}")
+    print(f"[info] patterns extracted: {len(patterns)} (top by score)")
     for pattern in patterns[:8]:
         print(f"  - {pattern['pattern_id']}: {pattern['title']} (score={pattern['score_total']}/13)")
 
     if not patterns:
         result = {
             "result": "PASS",
-            "detail": "no high-score technical patterns found",
+            "detail": "scanner found no technical patterns at all",
             "summary": {
                 "uploaded_patent_files": len(patent_docs),
                 "files_analyzed": to_int(
@@ -1954,7 +2036,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
             "patent_errors": patent_errors,
         }
         write_output_if_requested(result, options.output_json)
-        print("[result] PASS: no high-score patterns to compare")
+        print("[result] PASS: scanner returned zero patterns")
         return 0
 
     # ── 4-Layer Funnel Validation ─────────────────────────────────────
