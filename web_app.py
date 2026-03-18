@@ -18,6 +18,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.requests import Request as _StarletteRequest
 
@@ -780,3 +781,6 @@ async def get_preprocess_status(job_id: str) -> dict[str, Any]:
     else:
         job["elapsed_ms"] = job.get("duration_ms")
     return job
+
+
+app.mount("/", StaticFiles(directory=str(WEB_DIR)), name="static")
