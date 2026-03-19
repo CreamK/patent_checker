@@ -418,6 +418,173 @@
         margin-left: 4px;
       }
 
+      .cached-patents {
+        margin-top: 12px;
+        border: 1px dashed var(--line);
+        border-radius: 12px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.55);
+        max-height: 240px;
+        overflow: auto;
+      }
+
+      .cached-patents .cp-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .cached-patents .cp-header span {
+        font-size: 12px;
+        color: var(--ink-soft);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+
+      .cp-item {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 6px 0;
+        border-bottom: 1px dashed var(--line);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .cp-item:last-child {
+        border-bottom: none;
+      }
+
+      .cp-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .cp-title {
+        font-weight: 600;
+        color: var(--ink);
+        word-break: break-word;
+      }
+
+      .cp-meta {
+        color: var(--ink-soft);
+        font-size: 11px;
+        margin-top: 2px;
+      }
+
+      .cp-del {
+        flex-shrink: 0;
+        border: 1px solid var(--err);
+        background: rgba(214, 60, 60, 0.08);
+        color: var(--err);
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 120ms ease;
+      }
+
+      .cp-del:hover {
+        background: rgba(214, 60, 60, 0.2);
+      }
+
+      .cp-empty {
+        font-size: 12px;
+        color: var(--ink-soft);
+        text-align: center;
+        padding: 8px 0;
+      }
+
+      .cached-patents {
+        margin-top: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.55);
+        max-height: 220px;
+        overflow-y: auto;
+      }
+
+      .cached-patents .cp-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--ink-soft);
+        position: sticky;
+        top: 0;
+        background: rgba(255, 255, 255, 0.95);
+        z-index: 1;
+      }
+
+      .cached-patents .cp-count {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--accent);
+      }
+
+      .cp-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 7px 10px;
+        border-bottom: 1px dashed var(--line);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .cp-item:last-child {
+        border-bottom: none;
+      }
+
+      .cp-item .cp-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .cp-item .cp-title {
+        font-weight: 600;
+        color: var(--ink);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .cp-item .cp-meta {
+        color: var(--ink-soft);
+        font-size: 11px;
+        margin-top: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .cp-item .cp-kw {
+        margin-top: 3px;
+      }
+
+      .cp-del {
+        flex-shrink: 0;
+        border: none;
+        background: none;
+        color: var(--err);
+        cursor: pointer;
+        font-size: 13px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        line-height: 1;
+        opacity: 0.6;
+        transition: opacity 120ms;
+      }
+
+      .cp-del:hover {
+        opacity: 1;
+        background: rgba(214, 60, 60, 0.08);
+      }
+
       @media (max-width: 980px) {
         .layout {
           grid-template-columns: 1fr;
@@ -447,6 +614,15 @@
                 accept=".pdf,.doc,.docx,.txt,.md,.json,.xml,.html,.htm"
               />
               <div id="patent-selected" class="selected">未选择</div>
+            </div>
+
+            <label class="label-primary" style="margin-top:14px">已缓存的结构化专利</label>
+            <div id="cached-patents-box" class="cached-patents">
+              <div class="cp-head">
+                <span>加载中…</span>
+                <span id="cp-count" class="cp-count"></span>
+              </div>
+              <div id="cp-list"></div>
             </div>
 
             <button id="preprocess-btn" class="btn-secondary" disabled>预处理专利（AI 结构化提取）</button>
@@ -1331,8 +1507,9 @@
         }
 
         const hasPreprocess = Boolean(ppJobId)
-        if (!patentFiles.length && !hasPreprocess) {
-          alert('请先选择专利文件，或先点击「预处理专利」')
+        const cachedCount = document.querySelectorAll('#cp-list .cp-item').length
+        if (!patentFiles.length && !hasPreprocess && !cachedCount) {
+          alert('请先选择专利文件、预处理专利，或确保已有缓存专利。')
           return
         }
 
@@ -1376,6 +1553,12 @@
         form.append('max_matches', String(Number(ui.maxMatches.value) || 50))
         if (hasPreprocess) {
           form.append('preprocess_job_id', ppJobId)
+        }
+        if (!patentFiles.length && !hasPreprocess && cachedCount) {
+          form.append('use_cached_patents', 'true')
+        }
+        if (!patentFiles.length && !hasPreprocess && cachedCount) {
+          form.append('use_cached_patents', 'true')
         }
 
         try {
@@ -1453,6 +1636,67 @@
         }
       }
 
+      async function loadCachedPatents() {
+        const listEl = document.getElementById('cp-list')
+        const countEl = document.getElementById('cp-count')
+        const headEl = document.querySelector('#cached-patents-box .cp-head span:first-child')
+        try {
+          const resp = await fetch('/api/cached-patents')
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+          const items = await resp.json()
+          countEl.textContent = items.length ? `${items.length} 条` : ''
+          if (!items.length) {
+            headEl.textContent = '暂无缓存'
+            listEl.innerHTML = ''
+            return
+          }
+          headEl.textContent = '已缓存专利'
+          listEl.innerHTML = items.map(p => {
+            const title = p.title || p.raw_title || '(无标题)'
+            const abs = p.abstract || ''
+            const kwHtml = (p.keywords || []).slice(0, 4)
+              .map(k => `<span class="pp-tag">${k}</span>`).join('')
+            const hash = p.file_hash || ''
+            return `<div class="cp-item" data-hash="${hash}">
+              <div class="cp-info">
+                <div class="cp-title" title="${title}">${title}</div>
+                <div class="cp-meta" title="${abs}">${abs || '(无摘要)'}</div>
+                ${kwHtml ? `<div class="cp-kw">${kwHtml}</div>` : ''}
+              </div>
+              <button class="cp-del" title="删除此缓存" onclick="deleteCachedPatent('${hash}')">✕</button>
+            </div>`
+          }).join('')
+        } catch (err) {
+          headEl.textContent = '加载失败'
+          countEl.textContent = ''
+          listEl.innerHTML = `<div style="padding:8px 10px;font-size:12px;color:var(--err)">${err}</div>`
+        }
+      }
+
+      async function deleteCachedPatent(fileHash) {
+        if (!fileHash) return
+        if (!confirm('确认删除此缓存专利？删除后如需使用需重新预处理。')) return
+        try {
+          const resp = await fetch(`/api/cached-patents/${encodeURIComponent(fileHash)}`, { method: 'DELETE' })
+          if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}))
+            throw new Error(data.detail || `HTTP ${resp.status}`)
+          }
+          const el = document.querySelector(`.cp-item[data-hash="${fileHash}"]`)
+          if (el) el.remove()
+          const remaining = document.querySelectorAll('.cp-item').length
+          const countEl = document.getElementById('cp-count')
+          const headEl = document.querySelector('#cached-patents-box .cp-head span:first-child')
+          countEl.textContent = remaining ? `${remaining} 条` : ''
+          if (!remaining) {
+            headEl.textContent = '暂无缓存'
+          }
+        } catch (err) {
+          alert(`删除失败：${err.message || err}`)
+        }
+      }
+
+      loadCachedPatents()
       resumePreprocessIfNeeded()
       resumeActiveJobIfNeeded()
     </script>

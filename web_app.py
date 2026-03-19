@@ -52,6 +52,7 @@ from patnet_core import (
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 CORE_PATH = BASE_DIR / "patnet_core.py"
+REPOS_DIR = BASE_DIR / "repos"
 
 app = FastAPI(title="Patent Check Web", version="0.1.0")
 
@@ -90,12 +91,7 @@ async def _cleanup_repo_uploads() -> None:
             if now - info.get("created_ts", 0) > REPO_UPLOAD_TTL_SECONDS:
                 stale.append(uid)
         for uid in stale:
-            removed = REPO_UPLOADS.pop(uid, None)
-            if removed:
-                try:
-                    shutil.rmtree(removed["temp_root"])
-                except Exception:
-                    pass
+            REPO_UPLOADS.pop(uid, None)
 
 
 class RunRequest(BaseModel):
@@ -236,7 +232,7 @@ async def _run_upload_job(
     *,
     job_id: str,
     options: PatentCheckOptions,
-    temp_root: Path,
+    work_dir: Path,
 ) -> None:
     started_mono = time.monotonic()
     await _update_job(job_id, status="running", detail="扫描任务执行中", started_at=_now_ms(), stage="init")
@@ -273,7 +269,7 @@ async def _run_upload_job(
         )
     finally:
         try:
-            shutil.rmtree(temp_root)
+            shutil.rmtree(work_dir)
         except Exception:
             pass
         await _cleanup_jobs()
@@ -287,6 +283,9 @@ async def index() -> FileResponse:
     return FileResponse(page)
 
 
+PATENT_CACHE_DIR = BASE_DIR / ".patent_cache"
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {
@@ -295,6 +294,39 @@ async def health() -> dict[str, Any]:
         "core_exists": CORE_PATH.exists(),
         "cli_exists": CORE_PATH.exists(),
     }
+
+
+@app.get("/api/cached-patents")
+async def list_cached_patents() -> list[dict[str, Any]]:
+    if not PATENT_CACHE_DIR.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for p in sorted(PATENT_CACHE_DIR.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        items.append({
+            "file_hash": data.get("file_hash", p.stem),
+            "title": data.get("title", ""),
+            "raw_title": data.get("raw_title", ""),
+            "abstract": (data.get("abstract") or "")[:200],
+            "keywords": (data.get("keywords") or [])[:8],
+            "path": data.get("path", ""),
+        })
+    return items
+
+
+@app.delete("/api/cached-patents/{file_hash}")
+async def delete_cached_patent(file_hash: str) -> dict[str, Any]:
+    import re
+    if not re.fullmatch(r"[0-9a-fA-F]{16,128}", file_hash):
+        raise HTTPException(status_code=400, detail="invalid file_hash format")
+    target = PATENT_CACHE_DIR / f"{file_hash}.json"
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="cached patent not found")
+    target.unlink()
+    return {"deleted": file_hash}
 
 
 @app.post("/api/run")
@@ -357,14 +389,12 @@ async def run_scan(payload: RunRequest) -> dict[str, Any]:
 async def upload_repo(
     repo_zip: UploadFile = File(...),
 ) -> dict[str, Any]:
-    """Accept a zip of the repo, extract it, and store for later scan."""
+    """Accept a zip of the repo, extract it into repos/, and store for later scan."""
     await _cleanup_repo_uploads()
 
-    temp_root = Path(tempfile.mkdtemp(prefix="patent_repo_pre_")).resolve()
-    repo_dir = temp_root / "repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-
-    zip_path = temp_root / "repo.zip"
+    REPOS_DIR.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix="patent_repo_staging_")).resolve()
+    zip_path = staging_dir / "repo.zip"
 
     try:
         print("[Patent Check] 接收仓库 zip 文件…", flush=True)
@@ -373,8 +403,20 @@ async def upload_repo(
         zip_size_mb = zip_path.stat().st_size / 1024 / 1024
         print(f"[Patent Check] zip 已保存（{zip_size_mb:.1f} MB），开始解压…", flush=True)
 
-        extracted = 0
         repo_root_label = "uploaded-repo"
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = [m for m in zf.namelist() if not m.endswith("/")]
+            if members:
+                first_parts = Path(members[0]).parts
+                if len(first_parts) > 1:
+                    repo_root_label = first_parts[0]
+
+        repo_dir = REPOS_DIR / repo_root_label
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        repo_dir.mkdir(parents=True, exist_ok=True)
+
+        extracted = 0
         with zipfile.ZipFile(zip_path, "r") as zf:
             members = [m for m in zf.namelist() if not m.endswith("/")]
             total = len(members)
@@ -384,8 +426,6 @@ async def upload_repo(
                     continue
                 if any(p == ".." for p in parts):
                     continue
-                if len(parts) > 1 and repo_root_label == "uploaded-repo":
-                    repo_root_label = parts[0]
                 inner_parts = parts[1:] if len(parts) > 1 else parts
                 if not inner_parts:
                     continue
@@ -398,15 +438,15 @@ async def upload_repo(
                     print(f"[Patent Check] 已解压 {extracted}/{total}", flush=True)
 
         zip_path.unlink(missing_ok=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
         if extracted == 0:
             raise HTTPException(status_code=400, detail="zip 中没有可用文件")
 
         upload_id = uuid.uuid4().hex
-        print(f"[Patent Check] 仓库解压完成：{extracted} 个文件，upload_id={upload_id}", flush=True)
+        print(f"[Patent Check] 仓库解压至 repos/{repo_root_label}：{extracted} 个文件，upload_id={upload_id}", flush=True)
         await _store_repo_upload({
             "upload_id": upload_id,
-            "temp_root": str(temp_root),
             "repo_dir": str(repo_dir),
             "repo_root_label": repo_root_label,
             "file_count": extracted,
@@ -418,16 +458,10 @@ async def upload_repo(
             "repo_label": repo_root_label,
         }
     except HTTPException:
-        try:
-            shutil.rmtree(temp_root)
-        except Exception:
-            pass
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise
     except Exception as exc:
-        try:
-            shutil.rmtree(temp_root)
-        except Exception:
-            pass
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"repo zip upload failed: {exc}") from exc
 
 
@@ -441,15 +475,17 @@ async def run_scan_upload(
     preprocess_job_id: str = Form(default=""),
     repo_upload_id: str = Form(default=""),
     repo_path: str = Form(default=""),
+    use_cached_patents: str = Form(default=""),
 ) -> dict[str, Any]:
     pp_job_id = preprocess_job_id.strip()
     has_preprocess = bool(pp_job_id)
     ru_id = repo_upload_id.strip()
     local_repo_path = repo_path.strip()
+    want_cached = use_cached_patents.strip().lower() in ("true", "1", "yes")
 
     if not ru_id and not local_repo_path:
         raise HTTPException(status_code=400, detail="需要 repo_upload_id 或 repo_path")
-    if not patent_files and not has_preprocess:
+    if not patent_files and not has_preprocess and not want_cached:
         raise HTTPException(status_code=400, detail="patent_files is empty and no preprocess_job_id")
 
     if local_repo_path:
@@ -459,22 +495,21 @@ async def run_scan_upload(
         repo_dir = resolved
         repo_root_label = resolved.name
         saved_repo_files = sum(1 for _ in resolved.rglob("*") if _.is_file())
-        temp_root = Path(tempfile.mkdtemp(prefix="patent_web_local_")).resolve()
-        patents_dir = temp_root / "patents"
-        patents_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Patent Check] 使用本地路径: {resolved} ({saved_repo_files} 个文件)", flush=True)
     else:
         pre_upload = await _consume_repo_upload(ru_id)
         if not pre_upload:
             raise HTTPException(status_code=400, detail=f"repo_upload_id 未找到或已过期: {ru_id}")
-        temp_root = Path(pre_upload["temp_root"]).resolve()
         repo_dir = Path(pre_upload["repo_dir"]).resolve()
+        if not repo_dir.is_dir():
+            raise HTTPException(status_code=400, detail=f"仓库目录不存在: {repo_dir}")
         saved_repo_files = int(pre_upload["file_count"])
         repo_root_label = str(pre_upload.get("repo_root_label", "uploaded-repo"))
-        patents_dir = temp_root / "patents"
-        patents_dir.mkdir(parents=True, exist_ok=True)
 
-    output_json_path = temp_root / "result.json"
+    work_dir = Path(tempfile.mkdtemp(prefix="patent_scan_")).resolve()
+    patents_dir = work_dir / "patents"
+    patents_dir.mkdir(parents=True, exist_ok=True)
+    output_json_path = work_dir / "result.json"
     saved_patent_paths: list[Path] = []
     patent_upload_meta: list[dict[str, str]] = []
 
@@ -513,8 +548,28 @@ async def run_scan_upload(
                         for p in loaded
                     ]
 
+        if not saved_patent_paths and not parsed_patents_for_options and want_cached:
+            cache = PatentCache()
+            loaded_from_cache: list[ParsedPatent] = []
+            if PATENT_CACHE_DIR.is_dir():
+                for cp in sorted(PATENT_CACHE_DIR.glob("*.json")):
+                    try:
+                        cached = cache.get(cp.stem)
+                        if cached:
+                            loaded_from_cache.append(cached)
+                    except Exception:
+                        continue
+            if loaded_from_cache:
+                parsed_patents_for_options = loaded_from_cache
+                saved_patent_paths = [Path(p.path) for p in loaded_from_cache]
+                patent_upload_meta = [
+                    {"uploaded_name": Path(p.path).name, "file_name": Path(p.path).name}
+                    for p in loaded_from_cache
+                ]
+                print(f"[Patent Check] 使用缓存专利: {len(loaded_from_cache)} 条", flush=True)
+
         if not saved_patent_paths and not parsed_patents_for_options:
-            raise HTTPException(status_code=400, detail="no usable patent files uploaded")
+            raise HTTPException(status_code=400, detail="no usable patent files (upload, preprocess, or cache)")
 
         options = PatentCheckOptions(
             repo=str(repo_dir),
@@ -569,7 +624,7 @@ async def run_scan_upload(
             _run_upload_job(
                 job_id=job_id,
                 options=options,
-                temp_root=temp_root,
+                work_dir=work_dir,
             )
         )
         return {
@@ -581,16 +636,10 @@ async def run_scan_upload(
             "used_inputs": job_payload["used_inputs"],
         }
     except HTTPException:
-        try:
-            shutil.rmtree(temp_root)
-        except Exception:
-            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
         raise
     except Exception as exc:
-        try:
-            shutil.rmtree(temp_root)
-        except Exception:
-            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"failed to prepare upload job: {exc}") from exc
 
 
