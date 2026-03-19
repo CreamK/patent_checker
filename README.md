@@ -24,7 +24,7 @@ Make sure `claude` command is available in `PATH` (or set `CLAUDE_CODE_CLI_PATH`
 
 ```bash
 cd /Users/creamk/src/patent_check
-uvicorn web_app:app --reload --port 8090
+uvicorn web_app:app --reload --reload-exclude 'repos/*' --reload-exclude '.patent_cache/*' --port 8090
 ```
 
 Open: `http://127.0.0.1:8090`

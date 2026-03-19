@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -52,7 +53,7 @@ from patnet_core import (
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 CORE_PATH = BASE_DIR / "patnet_core.py"
-REPOS_DIR = BASE_DIR / "repos"
+REPOS_DIR = Path(os.environ.get("PATENT_CHECK_REPOS", str(Path.home() / ".patent_check" / "repos")))
 
 app = FastAPI(title="Patent Check Web", version="0.1.0")
 
