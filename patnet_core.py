@@ -1023,6 +1023,45 @@ def guess_title(path: Path, text: str) -> str:
     return path.stem
 
 
+_ABSTRACT_MARKERS = re.compile(
+    r"(?:摘\s*要|abstract|summary\s+of\s+the\s+invention|技术领域|technical\s+field)",
+    re.IGNORECASE,
+)
+_CLAIMS_MARKERS = re.compile(
+    r"(?:权\s*利\s*要\s*求\s*书?|claims?)\s*[:：]?\s*\n",
+    re.IGNORECASE,
+)
+
+
+def _extract_heuristic_summary(text: str, max_chars: int = 1500) -> str:
+    """Best-effort summary extraction for non-preprocessed patent text.
+
+    Tries to locate abstract / claims sections via common markers instead
+    of blindly taking the first N characters (which are often boilerplate).
+    """
+    if not text or not text.strip():
+        return text[:max_chars] if text else ""
+
+    parts: list[str] = []
+
+    am = _ABSTRACT_MARKERS.search(text)
+    if am:
+        after = text[am.start():]
+        parts.append(after[:800])
+
+    cm = _CLAIMS_MARKERS.search(text)
+    if cm:
+        after = text[cm.end():]
+        parts.append(after[:700])
+
+    if parts:
+        combined = "\n\n".join(parts)
+        if len(combined) >= 200:
+            return combined[:max_chars]
+
+    return text[:max_chars]
+
+
 def trim_text(text: str, max_chars: int) -> str:
     normalized = text.replace("\r\n", "\n").strip()
     if len(normalized) <= max_chars:
@@ -1554,32 +1593,90 @@ async def preprocess_patents(
 # Layer 1: BM25 fast recall
 # ---------------------------------------------------------------------------
 
+_JIEBA_AVAILABLE: bool | None = None
+
+
 def _simple_tokenize(text: str) -> list[str]:
-    """Tokenize mixed Chinese/English text without external dependencies."""
+    """Tokenize mixed Chinese/English text for BM25.
+
+    Uses jieba search-mode segmentation when available; falls back to
+    character bigrams for Chinese text so that multi-char terms still
+    carry discriminative power (single-char tokens are nearly useless
+    for BM25 because their IDF is extremely low).
+    """
+    global _JIEBA_AVAILABLE
+    if _JIEBA_AVAILABLE is None:
+        try:
+            import jieba  # type: ignore
+            jieba.setLogLevel(jieba.logging.WARNING)
+            _JIEBA_AVAILABLE = True
+        except ImportError:
+            _JIEBA_AVAILABLE = False
+
+    if _JIEBA_AVAILABLE:
+        return _tokenize_jieba(text)
+    return _tokenize_bigram_fallback(text)
+
+
+_STOPWORDS = frozenset({
+    "the", "and", "for", "that", "this", "with", "from", "are", "was",
+    "were", "been", "being", "have", "has", "had", "not", "but", "its",
+    "also", "such", "can", "may", "will", "each", "one", "two",
+    "method", "system", "device", "apparatus", "comprising", "wherein",
+    "thereof", "herein", "according", "based", "includes", "including",
+    "provided", "present", "described", "related", "using", "used",
+    "一种", "所述", "其中", "包括", "根据", "具有", "用于", "通过",
+    "以及", "或者", "并且", "其特征在于", "本发明", "技术",
+})
+
+
+def _tokenize_jieba(text: str) -> list[str]:
+    import jieba  # type: ignore
+
+    tokens: list[str] = []
+    for word in jieba.cut_for_search(text):
+        w = word.strip().lower()
+        if len(w) >= 2 and not w.isspace() and w not in _STOPWORDS:
+            tokens.append(w)
+    return tokens
+
+
+def _tokenize_bigram_fallback(text: str) -> list[str]:
+    """Fallback tokenizer: English words + Chinese bigrams."""
     tokens: list[str] = []
     text_lower = text.lower()
-    buf = []
+    ascii_buf: list[str] = []
+    cn_buf: list[str] = []
+
+    def _flush_ascii() -> None:
+        if ascii_buf:
+            word = "".join(ascii_buf)
+            ascii_buf.clear()
+            if len(word) >= 2 and word not in _STOPWORDS:
+                tokens.append(word)
+
+    def _flush_cn() -> None:
+        if cn_buf:
+            for i in range(len(cn_buf)):
+                if i + 1 < len(cn_buf):
+                    tokens.append(cn_buf[i] + cn_buf[i + 1])
+                if i + 2 < len(cn_buf):
+                    tokens.append(cn_buf[i] + cn_buf[i + 1] + cn_buf[i + 2])
+            cn_buf.clear()
+
     for ch in text_lower:
         if ch.isascii():
+            _flush_cn()
             if ch.isalnum():
-                buf.append(ch)
+                ascii_buf.append(ch)
             else:
-                if buf:
-                    word = "".join(buf)
-                    if len(word) >= 2:
-                        tokens.append(word)
-                    buf = []
+                _flush_ascii()
         else:
-            if buf:
-                word = "".join(buf)
-                if len(word) >= 2:
-                    tokens.append(word)
-                buf = []
-            tokens.append(ch)
-    if buf:
-        word = "".join(buf)
-        if len(word) >= 2:
-            tokens.append(word)
+            _flush_ascii()
+            cn_buf.append(ch)
+
+    _flush_ascii()
+    _flush_cn()
     return tokens
 
 
@@ -1588,7 +1685,16 @@ def bm25_recall(
     patent_docs: list[ParsedPatent],
     top_k: int = DEFAULT_RECALL_TOP_K,
 ) -> list[ParsedPatent]:
-    """BM25 recall: rank patents by relevance to patterns, return Top-K."""
+    """BM25 recall: per-pattern queries with max-score aggregation.
+
+    Instead of merging all patterns into one giant query (which dilutes
+    signal), we query once per pattern and keep the *maximum* score each
+    patent received across all patterns.  A patent only needs to be
+    relevant to ONE pattern to be recalled.
+
+    Patent keywords (from preprocessing) are appended to the corpus text
+    with repetition to boost their BM25 weight.
+    """
     if len(patent_docs) <= top_k:
         return list(patent_docs)
 
@@ -1598,7 +1704,11 @@ def bm25_recall(
         print("[warn] rank_bm25 not installed, skipping BM25 recall")
         return list(patent_docs)
 
-    corpus_texts = [p.summary_text or p.full_text[:2000] for p in patent_docs]
+    corpus_texts: list[str] = []
+    for p in patent_docs:
+        base = p.summary_text or p.full_text[:2000]
+        kw_boost = (" ".join(p.keywords) + " ") * 3 if p.keywords else ""
+        corpus_texts.append(f"{base} {kw_boost}")
     tokenized_corpus = [_simple_tokenize(t) for t in corpus_texts]
 
     if not any(tokenized_corpus):
@@ -1606,20 +1716,26 @@ def bm25_recall(
 
     bm25 = BM25Okapi(tokenized_corpus)
 
-    query_parts: list[str] = []
+    n = len(patent_docs)
+    aggregated = [0.0] * n
+
     for pat in patterns:
-        query_parts.append(str(pat.get("title") or ""))
-        query_parts.extend(to_str_list(pat.get("claim_angles")))
-        query_parts.append(str(pat.get("abstract_mechanism") or ""))
-        query_parts.append(str(pat.get("why_distinctive") or ""))
-    combined_query = " ".join(query_parts)
-    query_tokens = _simple_tokenize(combined_query)
+        query_text = " ".join(filter(None, [
+            str(pat.get("title") or ""),
+            str(pat.get("abstract_mechanism") or ""),
+            str(pat.get("why_distinctive") or ""),
+            str(pat.get("description") or ""),
+            *to_str_list(pat.get("claim_angles")),
+        ]))
+        query_tokens = _simple_tokenize(query_text)
+        if not query_tokens:
+            continue
+        scores = bm25.get_scores(query_tokens)
+        for i in range(n):
+            if scores[i] > aggregated[i]:
+                aggregated[i] = scores[i]
 
-    if not query_tokens:
-        return list(patent_docs)
-
-    scores = bm25.get_scores(query_tokens)
-    indexed_scores = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    indexed_scores = sorted(enumerate(aggregated), key=lambda x: x[1], reverse=True)
     top_indices = [idx for idx, _ in indexed_scores[:top_k]]
     return [patent_docs[i] for i in top_indices]
 
@@ -1652,9 +1768,19 @@ def build_light_validator_prompt(
     summaries_joined = "\n\n".join(summary_sections)
 
     return (
-        "You are screening patents for relevance to code patterns.\n"
-        "For each patent summary below, estimate how similar it is to the given patterns.\n"
-        "Only include patents with estimated_similarity >= 0.2.\n"
+        "You are screening patents for TECHNICAL METHOD relevance to code implementation patterns.\n\n"
+        "MATCHING GUIDANCE:\n"
+        "- Focus on the underlying technical APPROACH, ALGORITHM, or ARCHITECTURE, not surface keywords.\n"
+        "- A patent about 'gradient-based optimization' IS relevant to a pattern about 'loss minimization via backpropagation'.\n"
+        "- A patent about 'data caching' is NOT relevant to a pattern about 'data encryption' even though both mention 'data'.\n"
+        "- Consider functional equivalence: different terminology describing the same technical method counts as a match.\n\n"
+        "SIMILARITY SCALE:\n"
+        "- 0.0-0.2: No technical overlap in method or approach\n"
+        "- 0.2-0.4: Same general domain but fundamentally different approach\n"
+        "- 0.4-0.6: Similar technical approach with notable differences\n"
+        "- 0.6-0.8: Closely related technical method or architecture\n"
+        "- 0.8-1.0: Nearly identical technical approach\n\n"
+        "Include ALL patents with estimated_similarity >= 0.15.\n"
         "Output must be a JSON object only. No markdown, no explanation.\n\n"
         f"[code-patent-validator skill]\n{skill.content}\n\n"
         "[patterns (compact)]\n"
@@ -1668,6 +1794,7 @@ def build_light_validator_prompt(
         '      "patent_id": "patent-xxx",\n'
         '      "patent_title": "...",\n'
         '      "estimated_similarity": 0.0,\n'
+        '      "matched_pattern_ids": ["pattern-1"],\n'
         '      "brief_reason": "..."\n'
         "    }\n"
         "  ]\n"
@@ -1696,7 +1823,7 @@ async def light_rerank(
         patent_summaries.append({
             "id": pid,
             "title": p.title or p.raw_title,
-            "summary": (p.summary_text or p.full_text[:800])[:800],
+            "summary": (p.summary_text or p.full_text[:1500])[:1500],
         })
         id_map[pid] = p
 
@@ -1940,7 +2067,7 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
                 title=d.get("title", ""),
                 abstract="",
                 full_text=d.get("text", ""),
-                summary_text=d.get("text", "")[:1500],
+                summary_text=_extract_heuristic_summary(d.get("text", "")),
             )
             for d in legacy_docs
         ]
