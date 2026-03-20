@@ -1110,9 +1110,11 @@
         ui.detailText.textContent =
           (data.detail || '扫描任务执行中') +
           ` | ${Number.isFinite(elapsedMs) ? elapsedMs : 0} ms | repo_files=${stat.repo_files || 0}, patent_files=${stat.patent_files || 0}`
-        if (!ui.stdoutBox.textContent || ui.stdoutBox.textContent === '-') {
-          ui.stdoutBox.textContent = '(任务运行中，完成后展示)'
-        }
+        const liveOut = data.stdout || ''
+        const liveErr = data.stderr || ''
+        ui.stdoutBox.textContent = liveOut || '(等待输出…)'
+        ui.stderrBox.textContent = liveErr || '-'
+        if (liveOut) ui.stdoutBox.scrollTop = ui.stdoutBox.scrollHeight
       }
 
       function clearPpState() {

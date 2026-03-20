@@ -205,9 +205,15 @@ class _TeeWriter:
             self._original.flush()
 
 
-async def _run_core_patent_check(options: PatentCheckOptions) -> tuple[int, str, str, dict[str, Any] | None]:
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
+async def _run_core_patent_check(
+    options: PatentCheckOptions,
+    stdout_buffer: io.StringIO | None = None,
+    stderr_buffer: io.StringIO | None = None,
+) -> tuple[int, str, str, dict[str, Any] | None]:
+    if stdout_buffer is None:
+        stdout_buffer = io.StringIO()
+    if stderr_buffer is None:
+        stderr_buffer = io.StringIO()
     real_stdout = sys.stdout
     real_stderr = sys.stderr
     tee_out = _TeeWriter(stdout_buffer, real_stdout)
@@ -236,7 +242,14 @@ async def _run_upload_job(
     work_dir: Path,
 ) -> None:
     started_mono = time.monotonic()
-    await _update_job(job_id, status="running", detail="扫描任务执行中", started_at=_now_ms(), stage="init")
+
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    await _update_job(
+        job_id, status="running", detail="扫描任务执行中",
+        started_at=_now_ms(), stage="init",
+        _live_stdout=stdout_buf, _live_stderr=stderr_buf,
+    )
 
     async def _on_stage(stage: str, detail: str = "") -> None:
         await _update_job(job_id, stage=stage, detail=detail or stage)
@@ -244,7 +257,9 @@ async def _run_upload_job(
     options.on_stage = _on_stage
 
     try:
-        exit_code, stdout_text, stderr_text, result_json = await _run_core_patent_check(options)
+        exit_code, stdout_text, stderr_text, result_json = await _run_core_patent_check(
+            options, stdout_buffer=stdout_buf, stderr_buffer=stderr_buf,
+        )
         duration_ms = int((time.monotonic() - started_mono) * 1000)
 
         await _update_job(
@@ -257,6 +272,7 @@ async def _run_upload_job(
             stdout=stdout_text,
             stderr=stderr_text,
             result_json=result_json,
+            _live_stdout=None, _live_stderr=None,
         )
     except Exception as exc:
         duration_ms = int((time.monotonic() - started_mono) * 1000)
@@ -267,6 +283,9 @@ async def _run_upload_job(
             finished_at=_now_ms(),
             duration_ms=duration_ms,
             error=str(exc),
+            stdout=stdout_buf.getvalue(),
+            stderr=stderr_buf.getvalue(),
+            _live_stdout=None, _live_stderr=None,
         )
     finally:
         try:
@@ -661,8 +680,18 @@ async def get_run_upload_job(job_id: str) -> dict[str, Any]:
             job["elapsed_ms"] = max(0, _now_ms() - started_ms)
         else:
             job["elapsed_ms"] = 0
+
+        live_out = job.get("_live_stdout")
+        live_err = job.get("_live_stderr")
+        if live_out and isinstance(live_out, io.StringIO):
+            job["stdout"] = live_out.getvalue()
+        if live_err and isinstance(live_err, io.StringIO):
+            job["stderr"] = live_err.getvalue()
     else:
         job["elapsed_ms"] = job.get("duration_ms")
+
+    job.pop("_live_stdout", None)
+    job.pop("_live_stderr", None)
     return job
 
 
