@@ -1680,6 +1680,37 @@ def _tokenize_bigram_fallback(text: str) -> list[str]:
     return tokens
 
 
+def _cjk_ratio(text: str) -> float:
+    """Return the fraction of characters that are CJK ideographs."""
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    alpha = sum(1 for ch in text if ch.isalpha())
+    return cjk / alpha if alpha else 0.0
+
+
+def _detect_cross_lingual(patterns: list[dict[str, Any]], patent_docs: list[ParsedPatent]) -> bool:
+    """Detect if patterns and patents are in different languages.
+
+    Returns True when one side is predominantly CJK and the other is
+    predominantly Latin — BM25 lexical matching is useless in this case.
+    """
+    pat_sample = " ".join(
+        str(p.get("title") or "") + " " + str(p.get("abstract_mechanism") or "")
+        for p in patterns[:10]
+    )
+    doc_sample = " ".join(
+        (p.title or "") + " " + (p.abstract or p.summary_text or "")[:200]
+        for p in patent_docs[:20]
+    )
+    pat_cjk = _cjk_ratio(pat_sample)
+    doc_cjk = _cjk_ratio(doc_sample)
+    is_cross = (pat_cjk < 0.15 and doc_cjk > 0.4) or (pat_cjk > 0.4 and doc_cjk < 0.15)
+    if is_cross:
+        print(f"[info] cross-lingual detected: pattern CJK={pat_cjk:.0%} vs patent CJK={doc_cjk:.0%}")
+    return is_cross
+
+
 def bm25_recall(
     patterns: list[dict[str, Any]],
     patent_docs: list[ParsedPatent],
@@ -1694,8 +1725,16 @@ def bm25_recall(
 
     Patent keywords (from preprocessing) are appended to the corpus text
     with repetition to boost their BM25 weight.
+
+    When a cross-lingual mismatch is detected (e.g. English patterns vs
+    Chinese patents), BM25 is skipped entirely because lexical matching
+    produces near-zero scores for all documents.
     """
     if len(patent_docs) <= top_k:
+        return list(patent_docs)
+
+    if _detect_cross_lingual(patterns, patent_docs):
+        print(f"[info] BM25 skipped: cross-lingual scenario, passing all {len(patent_docs)} patents to LLM layers")
         return list(patent_docs)
 
     try:
@@ -1802,33 +1841,30 @@ def build_light_validator_prompt(
     )
 
 
-async def light_rerank(
+LIGHT_RERANK_BATCH_SIZE = 30
+
+
+async def _light_rerank_batch(
     cloud_client: "SimpleClaudeCodeClient",
     validator_skill: SkillLoadResult,
     patterns: list[dict[str, Any]],
-    candidates: list[ParsedPatent],
-    top_n: int,
+    batch: list[ParsedPatent],
+    id_map: dict[str, ParsedPatent],
     workspace_path: Path,
     timeout: int,
-    idle_timeout: int = IDLE_TIMEOUT,
-) -> list[ParsedPatent]:
-    """Layer 2: Light LLM reranking using summaries only."""
-    if len(candidates) <= top_n:
-        return list(candidates)
-
+    idle_timeout: int,
+) -> list[tuple[float, ParsedPatent]]:
+    """Run light rerank on a single batch, returning (similarity, patent) pairs."""
     patent_summaries = []
-    id_map: dict[str, ParsedPatent] = {}
-    for i, p in enumerate(candidates):
+    for p in batch:
         pid = f"patent-{p.file_hash[:8]}"
         patent_summaries.append({
             "id": pid,
             "title": p.title or p.raw_title,
             "summary": (p.summary_text or p.full_text[:1500])[:1500],
         })
-        id_map[pid] = p
 
     prompt = build_light_validator_prompt(validator_skill, patterns, patent_summaries)
-
     try:
         raw = await cloud_client.analyze(
             message=prompt,
@@ -1839,36 +1875,80 @@ async def light_rerank(
         )
         payload = extract_json_payload(raw)
     except Exception as exc:
-        print(f"[warn] light rerank failed: {exc}, keeping all candidates")
-        return candidates[:top_n]
+        print(f"[warn] light rerank batch failed: {exc}")
+        return [(0.0, p) for p in batch]
 
     if not payload:
-        return candidates[:top_n]
+        return [(0.0, p) for p in batch]
 
     rankings = payload.get("rankings", [])
     if not isinstance(rankings, list):
-        return candidates[:top_n]
+        return [(0.0, p) for p in batch]
 
-    ranked: list[tuple[float, ParsedPatent]] = []
-    seen_ids: set[str] = set()
+    results: list[tuple[float, ParsedPatent]] = []
+    seen: set[str] = set()
     for item in rankings:
         if not isinstance(item, dict):
             continue
         pid = str(item.get("patent_id") or "").strip()
         sim = to_float(item.get("estimated_similarity"), 0.0)
-        if pid in id_map and pid not in seen_ids:
-            seen_ids.add(pid)
-            ranked.append((sim, id_map[pid]))
+        if pid in id_map and pid not in seen:
+            seen.add(pid)
+            results.append((sim, id_map[pid]))
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    result = [p for _, p in ranked[:top_n]]
-
-    for p in candidates:
+    for p in batch:
         pid = f"patent-{p.file_hash[:8]}"
-        if pid not in seen_ids and len(result) < top_n:
-            result.append(p)
+        if pid not in seen:
+            results.append((0.0, p))
 
-    return result[:top_n]
+    return results
+
+
+async def light_rerank(
+    cloud_client: "SimpleClaudeCodeClient",
+    validator_skill: SkillLoadResult,
+    patterns: list[dict[str, Any]],
+    candidates: list[ParsedPatent],
+    top_n: int,
+    workspace_path: Path,
+    timeout: int,
+    idle_timeout: int = IDLE_TIMEOUT,
+) -> list[ParsedPatent]:
+    """Layer 2: Light LLM reranking using summaries only.
+
+    When candidates exceed LIGHT_RERANK_BATCH_SIZE (e.g. cross-lingual
+    scenarios where BM25 is skipped), process in batches and merge results.
+    """
+    if len(candidates) <= top_n:
+        return list(candidates)
+
+    id_map: dict[str, ParsedPatent] = {}
+    for p in candidates:
+        id_map[f"patent-{p.file_hash[:8]}"] = p
+
+    all_ranked: list[tuple[float, ParsedPatent]] = []
+
+    if len(candidates) <= LIGHT_RERANK_BATCH_SIZE:
+        all_ranked = await _light_rerank_batch(
+            cloud_client, validator_skill, patterns, candidates,
+            id_map, workspace_path, timeout, idle_timeout,
+        )
+    else:
+        batches = [
+            candidates[i:i + LIGHT_RERANK_BATCH_SIZE]
+            for i in range(0, len(candidates), LIGHT_RERANK_BATCH_SIZE)
+        ]
+        print(f"[info] light rerank: {len(candidates)} candidates -> {len(batches)} batches of ~{LIGHT_RERANK_BATCH_SIZE}")
+        for batch_idx, batch in enumerate(batches):
+            print(f"[info] light rerank batch {batch_idx + 1}/{len(batches)} ({len(batch)} patents) ...")
+            batch_results = await _light_rerank_batch(
+                cloud_client, validator_skill, patterns, batch,
+                id_map, workspace_path, timeout, idle_timeout,
+            )
+            all_ranked.extend(batch_results)
+
+    all_ranked.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in all_ranked[:top_n]]
 
 
 # ---------------------------------------------------------------------------
@@ -2178,12 +2258,19 @@ async def run_patent_check(options: PatentCheckOptions) -> int:
         funnel["layer1_recalled"] = len(recalled)
         print(f"[info] Layer 1 result: {len(recalled)} patents recalled")
 
+        # When BM25 was skipped (cross-lingual), widen Layer 2 to compensate
+        bm25_was_skipped = len(recalled) == len(all_parsed) and len(all_parsed) > options.recall_top_k
+        rerank_top_n = options.rerank_top_n
+        if bm25_was_skipped:
+            rerank_top_n = max(options.rerank_top_n, min(len(recalled), options.rerank_top_n * 3))
+            print(f"[info] BM25 skipped (cross-lingual), expanding Layer 2 top_n: {options.rerank_top_n} -> {rerank_top_n}")
+
         # Layer 2: Light LLM rerank
-        await _emit_stage("layer2_rerank", f"轻量 LLM 复筛 ({len(recalled)} → Top-{options.rerank_top_n})")
-        print(f"[info] Layer 2: light LLM rerank (top_n={options.rerank_top_n}) ...")
+        await _emit_stage("layer2_rerank", f"轻量 LLM 复筛 ({len(recalled)} → Top-{rerank_top_n})")
+        print(f"[info] Layer 2: light LLM rerank (top_n={rerank_top_n}) ...")
         reranked = await light_rerank(
             cloud_client, validator_skill, patterns, recalled,
-            top_n=options.rerank_top_n,
+            top_n=rerank_top_n,
             workspace_path=repo_path,
             timeout=options.timeout,
             idle_timeout=options.idle_timeout,
